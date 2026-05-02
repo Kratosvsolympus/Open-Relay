@@ -1,0 +1,111 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "Open UI/**"
+      - "OpenUIWidgets/**"
+      - "Open UI.xcodeproj/**"
+      - ".github/workflows/build-ios-ipa.yml"
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcodebuild -showsdks
+          swift --version
+
+      - name: Clone local MarkdownView dependency
+        run: |
+          git clone --depth 1 https://github.com/Ichigo3766/MarkdownView.git ../MarkdownView
+
+      - name: Remove restricted CI entitlements
+        run: |
+          /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.background-tasks.continued-processing.gpu" "Open UI/Open UI.entitlements" || true
+
+      - name: Resolve Swift packages
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project "Open UI.xcodeproj" \
+            -scheme "Open UI" \
+            -clonedSourcePackagesDirPath SourcePackages \
+            | tee resolve-packages.log
+
+      - name: Build app for device
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project "Open UI.xcodeproj" \
+            -scheme "Open UI" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            -clonedSourcePackagesDirPath SourcePackages \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ONLY_ACTIVE_ARCH=NO \
+            | tee xcodebuild.log
+
+      - name: Package unsigned IPAs
+        run: |
+          set -euo pipefail
+
+          PRODUCTS_DIR="build/DerivedData/Build/Products/Release-iphoneos"
+          APP_PATH="$(find "$PRODUCTS_DIR" -maxdepth 1 -name "*.app" -print -quit)"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle found in $PRODUCTS_DIR"
+            exit 1
+          fi
+
+          APP_NAME="$(basename "$APP_PATH")"
+          mkdir -p artifacts/full/Payload artifacts/livecontainer/Payload
+
+          ditto "$APP_PATH" "artifacts/full/Payload/$APP_NAME"
+          ditto "$APP_PATH" "artifacts/livecontainer/Payload/$APP_NAME"
+
+          rm -rf "artifacts/livecontainer/Payload/$APP_NAME/PlugIns"
+          rm -rf "artifacts/livecontainer/Payload/$APP_NAME/Watch"
+          find artifacts -name "_CodeSignature" -type d -prune -exec rm -rf {} +
+          find artifacts -name "embedded.mobileprovision" -delete
+
+          (cd artifacts/full && zip -qry "../OpenRelay-full-unsigned.ipa" Payload)
+          (cd artifacts/livecontainer && zip -qry "../OpenRelay-livecontainer-unsigned.ipa" Payload)
+
+          ls -lh artifacts/*.ipa
+
+      - name: Upload IPA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openrelay-unsigned-ipa
+          path: |
+            artifacts/OpenRelay-full-unsigned.ipa
+            artifacts/OpenRelay-livecontainer-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openrelay-build-logs
+          path: |
+            resolve-packages.log
+            xcodebuild.log
+          if-no-files-found: ignore
