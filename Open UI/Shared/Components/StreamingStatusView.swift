@@ -367,6 +367,12 @@ struct PulsingDot: View {
                     opacity = 1.0
                 }
             }
+            // Bug 7: stop the repeatForever CAAnimation when the view leaves the tree
+            // so the underlying layer animation is invalidated immediately rather than
+            // continuing to run until UIKit's view recycling discards the layer.
+            .onDisappear {
+                withAnimation(nil) { opacity = 0.3 }
+            }
     }
 }
 
@@ -378,31 +384,23 @@ private struct ShimmerText: View {
     @State private var shimmerPhase: CGFloat = -1.0
 
     var body: some View {
+        // Bug 6: removed GeometryReader from the overlay (two-pass layout + duplicated
+        // Text render). The shimmer gradient is now applied as foregroundStyle directly
+        // so both layout passes and the duplicate Text node are eliminated.
         Text(text)
             .scaledFont(size: 12, weight: .medium)
-            .foregroundStyle(theme.textSecondary)
             .lineLimit(1)
-            .overlay {
-                GeometryReader { geo in
-                    LinearGradient(
-                        colors: [
-                            .clear,
-                            theme.brandPrimary.opacity(0.35),
-                            .clear
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .frame(width: geo.size.width * 0.4)
-                    .offset(x: shimmerPhase * geo.size.width)
-                    .blendMode(.sourceAtop)
-                }
-                .mask {
-                    Text(text)
-                        .scaledFont(size: 12, weight: .medium)
-                        .lineLimit(1)
-                }
-            }
+            .foregroundStyle(
+                LinearGradient(
+                    stops: [
+                        .init(color: theme.textSecondary, location: max(0, shimmerPhase - 0.2)),
+                        .init(color: theme.brandPrimary.opacity(0.85), location: shimmerPhase),
+                        .init(color: theme.textSecondary, location: min(1, shimmerPhase + 0.2))
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            )
             .onAppear {
                 withAnimation(
                     .linear(duration: 1.8)
@@ -410,6 +408,10 @@ private struct ShimmerText: View {
                 ) {
                     shimmerPhase = 1.2
                 }
+            }
+            // Bug 7: stop the animation when the view leaves the hierarchy.
+            .onDisappear {
+                withAnimation(nil) { shimmerPhase = -1.0 }
             }
     }
 }

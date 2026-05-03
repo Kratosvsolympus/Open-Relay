@@ -2,6 +2,14 @@ import Foundation
 import os.log
 import SwiftUI
 
+// MARK: - Animation constants (channel message list)
+private extension Animation {
+    /// Quick ease-out used for message removal / insertion animations.
+    static let messageRemove = Animation.easeOut(duration: 0.18)
+    /// Gentle spring used for content updates (edits, reactions, pins).
+    static let messageUpdate = Animation.easeInOut(duration: 0.15)
+}
+
 /// Manages state and logic for a single channel conversation.
 /// Handles messages, threading, reactions, @mentions (users + models),
 /// file uploads, pinning, and real-time Socket.IO updates.
@@ -658,22 +666,32 @@ final class ChannelViewModel {
     func deleteMessage(id: String) async {
         guard let apiClient else { return }
         
+        // Optimistic removal — animated so the list collapses immediately
         let removedIdx = messages.firstIndex(where: { $0.id == id })
         let removedMsg = removedIdx.map { messages[$0] }
-        if let idx = removedIdx { messages.remove(at: idx) }
+        if let idx = removedIdx {
+            withAnimation(.messageRemove) { messages.remove(at: idx) }
+        }
         
         let removedThreadIdx = threadMessages.firstIndex(where: { $0.id == id })
         let removedThreadMsg = removedThreadIdx.map { threadMessages[$0] }
-        if let idx = removedThreadIdx { threadMessages.remove(at: idx) }
+        if let idx = removedThreadIdx {
+            withAnimation(.messageRemove) { threadMessages.remove(at: idx) }
+        }
         
         do {
             try await apiClient.deleteChannelMessage(channelId: channelId, messageId: id)
         } catch {
+            // Revert on failure
             if let msg = removedMsg, let idx = removedIdx {
-                messages.insert(msg, at: min(idx, messages.count))
+                withAnimation(.messageRemove) {
+                    messages.insert(msg, at: min(idx, messages.count))
+                }
             }
             if let msg = removedThreadMsg, let idx = removedThreadIdx {
-                threadMessages.insert(msg, at: min(idx, threadMessages.count))
+                withAnimation(.messageRemove) {
+                    threadMessages.insert(msg, at: min(idx, threadMessages.count))
+                }
             }
             logger.error("Failed to delete message: \(error.localizedDescription)")
         }
@@ -1110,9 +1128,13 @@ final class ChannelViewModel {
         case .messageUpdate, .channelMessageUpdate:
             handleMessageUpdateEvent(data)
             
-        case .channelMessageDelete:
+        case .messageDelete, .channelMessageDelete:
             handleMessageDeleteEvent(data)
-            
+
+        case .channelMessagePinned, .channelMessageUnpinned,
+             .messagePinned, .messageUnpinned:
+            handlePinEvent(data)
+
         case .channelReactionAdd, .channelReactionRemove,
              .messageReactionAdd, .messageReactionRemove:
             handleReactionEvent(data)
@@ -1226,11 +1248,65 @@ final class ChannelViewModel {
     }
     
     private func handleMessageDeleteEvent(_ data: [String: Any]) {
-        if let msgId = data["message_id"] as? String
-            ?? (data["data"] as? [String: Any])?["id"] as? String {
+        // The server sends delete events with the id in several possible locations:
+        //   { "message_id": "xxx" }
+        //   { "id": "xxx" }
+        //   { "data": { "id": "xxx" } }
+        //   { "data": { "message_id": "xxx" } }
+        let inner = data["data"] as? [String: Any]
+        guard let msgId = data["message_id"] as? String
+            ?? data["id"] as? String
+            ?? inner?["id"] as? String
+            ?? inner?["message_id"] as? String
+        else { return }
+
+        logger.debug("Remote message delete: id=\(msgId)")
+        withAnimation(.messageRemove) {
             messages.removeAll { $0.id == msgId }
             threadMessages.removeAll { $0.id == msgId }
         }
+    }
+
+    /// Handles remote pin/unpin events from other clients.
+    /// Tries to parse the full message from the payload; falls back to a single-field flip.
+    private func handlePinEvent(_ data: [String: Any]) {
+        // Try to get a full message object first — ideal path
+        let msgData = data["data"] as? [String: Any] ?? data
+        if let msg = ChannelMessage.fromJSON(msgData) {
+            logger.debug("Remote pin event for id=\(msg.id), isPinned=\(msg.isPinned)")
+            withAnimation(.messageUpdate) {
+                if let idx = messages.firstIndex(where: { $0.id == msg.id }) {
+                    messages[idx] = msg
+                }
+                if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
+                    threadMessages[idx] = msg
+                }
+            }
+            Task { await loadPinnedMessages() }
+            return
+        }
+
+        // Fallback: just flip isPinned using message_id + event type
+        let inner = data["data"] as? [String: Any]
+        guard let msgId = data["message_id"] as? String
+            ?? data["id"] as? String
+            ?? inner?["id"] as? String
+            ?? inner?["message_id"] as? String
+        else { return }
+
+        let rawType = (data["type"] as? String) ?? ""
+        let nowPinned = rawType.contains("pinned") && !rawType.contains("unpinned")
+        logger.debug("Remote pin flip for id=\(msgId), isPinned=\(nowPinned)")
+
+        withAnimation(.messageUpdate) {
+            if let idx = messages.firstIndex(where: { $0.id == msgId }) {
+                messages[idx].isPinned = nowPinned
+            }
+            if let idx = threadMessages.firstIndex(where: { $0.id == msgId }) {
+                threadMessages[idx].isPinned = nowPinned
+            }
+        }
+        Task { await loadPinnedMessages() }
     }
     
     private func handleReactionEvent(_ data: [String: Any]) {

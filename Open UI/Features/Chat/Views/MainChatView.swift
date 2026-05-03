@@ -2316,6 +2316,22 @@ struct MainChatView: View {
 
                 Spacer()
 
+                // Update available icon — only visible when an update is pending
+                if dependencies.updateChecker.pendingUpdate != nil {
+                    Button {
+                        closeDrawer()
+                        dependencies.updateChecker.reopenUpdate()
+                    } label: {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .scaledFont(size: 16, weight: .medium)
+                            .foregroundStyle(.tint)
+                            .frame(width: 40, height: 40)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Update Available")
+                    .transition(.scale.combined(with: .opacity))
+                }
+
                 // New Chat — primary action, always visible
                 Button {
                     closeDrawer()

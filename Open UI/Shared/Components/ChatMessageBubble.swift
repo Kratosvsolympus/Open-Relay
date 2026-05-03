@@ -188,9 +188,12 @@ struct TypingIndicator: View {
                     .frame(width: 7, height: 7)
                     .scaleEffect(animate ? 1.0 : 0.5)
                     .opacity(animate ? 1.0 : 0.3)
+                    // Bug 15: repeatForever() defaults to autoreverses: false, causing
+                    // a hard snap back to 0.5 at each loop boundary — a visible flicker.
+                    // Adding autoreverses: true produces a smooth breathing wave instead.
                     .animation(
                         .easeInOut(duration: 0.6)
-                            .repeatForever()
+                            .repeatForever(autoreverses: true)
                             .delay(Double(i) * 0.2),
                         value: animate
                     )
@@ -199,6 +202,11 @@ struct TypingIndicator: View {
         .padding(.horizontal, Spacing.sm)
         .padding(.vertical, Spacing.sm)
         .onAppear { animate = true }
+        // Bug 8: explicitly stop the three repeatForever CAAnimations when TypingIndicator
+        // leaves the hierarchy (first token arrives). Without this, the CAAnimation objects
+        // remain alive on their hosting layers until UIKit's view recycling discards them,
+        // accumulating over multiple regenerations.
+        .onDisappear { animate = false }
     }
 }
 

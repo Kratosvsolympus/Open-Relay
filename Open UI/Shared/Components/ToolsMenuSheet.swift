@@ -8,17 +8,25 @@ struct ToolItem: Identifiable, Hashable {
     var name: String
     var description: String?
     var isEnabled: Bool
+    /// True if the server reports this tool has user-configurable valves.
+    var hasUserValves: Bool
+    /// True if this item is a toggle-filter function (not a regular tool).
+    var isFunctionTool: Bool
 
     init(
         id: String = UUID().uuidString,
         name: String,
         description: String? = nil,
-        isEnabled: Bool = false
+        isEnabled: Bool = false,
+        hasUserValves: Bool = false,
+        isFunctionTool: Bool = false
     ) {
         self.id = id
         self.name = name
         self.description = description
         self.isEnabled = isEnabled
+        self.hasUserValves = hasUserValves
+        self.isFunctionTool = isFunctionTool
     }
 }
 
@@ -43,10 +51,31 @@ struct ToolsMenuSheet: View {
     var onReferenceChatAttachment: (() -> Void)?
     /// Optional custom photo picker view (e.g. SwiftUI PhotosPicker).
     var photoPicker: AnyView?
+    /// Called when the user taps the gear icon on a tool that has user valves.
+    /// Receives (toolId, isFunctionTool).
+    var onOpenToolUserValves: ((String, Bool) -> Void)?
 
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     @State private var toolsExpanded = true
+
+    // MARK: - Quick Pills (shared AppStorage key with ChatInputField)
+    @AppStorage("quickPills") private var quickPillsData: String = ""
+
+    private var savedQuickPillIds: Set<String> {
+        Set(quickPillsData.components(separatedBy: ",").filter { !$0.isEmpty })
+    }
+
+    private func toggleQuickPill(_ id: String) {
+        var ids = quickPillsData.components(separatedBy: ",").filter { !$0.isEmpty }
+        if ids.contains(id) {
+            ids.removeAll { $0 == id }
+        } else {
+            ids.append(id)
+        }
+        quickPillsData = ids.joined(separator: ",")
+        Haptics.play(.light)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -206,7 +235,8 @@ struct ToolsMenuSheet: View {
             icon: "magnifyingglass",
             title: String(localized: "Web Search"),
             subtitle: String(localized: "Search the web and cite sources in replies"),
-            isOn: $webSearchEnabled
+            isOn: $webSearchEnabled,
+            pillId: "web"
         )
     }
 
@@ -215,7 +245,8 @@ struct ToolsMenuSheet: View {
             icon: "photo.badge.plus",
             title: String(localized: "Image Generation"),
             subtitle: String(localized: "Generate images from text descriptions"),
-            isOn: $imageGenerationEnabled
+            isOn: $imageGenerationEnabled,
+            pillId: "image"
         )
     }
 
@@ -232,7 +263,8 @@ struct ToolsMenuSheet: View {
         icon: String,
         title: String,
         subtitle: String?,
-        isOn: Binding<Bool>
+        isOn: Binding<Bool>,
+        pillId: String? = nil
     ) -> some View {
         Button {
             withAnimation(MicroAnimation.snappy) {
@@ -263,6 +295,23 @@ struct ToolsMenuSheet: View {
                 }
 
                 Spacer()
+
+                // Star / quick-pin button
+                if let pillId {
+                    let isPinned = savedQuickPillIds.contains(pillId)
+                    Button {
+                        toggleQuickPill(pillId)
+                    } label: {
+                        Image(systemName: isPinned ? "star.fill" : "star")
+                            .scaledFont(size: 14, weight: .medium)
+                            .foregroundStyle(isPinned ? theme.brandPrimary : theme.textTertiary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(isPinned ? "Remove from quick actions" : "Add to quick actions")
+                    .animation(MicroAnimation.snappy, value: isPinned)
+                }
 
                 // Toggle pill
                 togglePill(isOn: isOn.wrappedValue)
@@ -402,58 +451,97 @@ struct ToolsMenuSheet: View {
     private func toolTile(tool: ToolItem) -> some View {
         let isSelected = selectedToolIds.contains(tool.id)
 
-        return Button {
-            withAnimation(MicroAnimation.snappy) {
-                if isSelected {
-                    selectedToolIds.remove(tool.id)
-                } else {
-                    selectedToolIds.insert(tool.id)
-                }
-            }
-            Haptics.play(.light)
-        } label: {
-            HStack(spacing: Spacing.sm) {
-                toolGlyph(
-                    systemImage: toolIcon(for: tool),
-                    isSelected: isSelected
-                )
-
-                VStack(alignment: .leading, spacing: Spacing.xs) {
-                    Text(tool.name)
-                        .scaledFont(size: 14)
-                        .fontWeight(isSelected ? .semibold : .medium)
-                        .foregroundStyle(theme.textPrimary)
-                        .lineLimit(1)
-
-                    if let desc = tool.description, !desc.isEmpty {
-                        Text(desc)
-                            .scaledFont(size: 12, weight: .medium)
-                            .foregroundStyle(theme.textSecondary)
-                            .lineLimit(2)
+        return HStack(spacing: 0) {
+            // Main toggle area
+            Button {
+                withAnimation(MicroAnimation.snappy) {
+                    if isSelected {
+                        selectedToolIds.remove(tool.id)
+                    } else {
+                        selectedToolIds.insert(tool.id)
                     }
                 }
-
-                Spacer()
-
-                togglePill(isOn: isSelected)
-            }
-            .padding(Spacing.sm)
-            .background(tileBackground(isOn: isSelected))
-            .clipShape(
-                RoundedRectangle(cornerRadius: CornerRadius.input, style: .continuous)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: CornerRadius.input, style: .continuous)
-                    .strokeBorder(
-                        tileBorderColor(isOn: isSelected),
-                        lineWidth: 0.5
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: Spacing.sm) {
+                    toolGlyph(
+                        systemImage: toolIcon(for: tool),
+                        isSelected: isSelected
                     )
-            )
+
+                    VStack(alignment: .leading, spacing: Spacing.xs) {
+                        Text(tool.name)
+                            .scaledFont(size: 14)
+                            .fontWeight(isSelected ? .semibold : .medium)
+                            .foregroundStyle(theme.textPrimary)
+                            .lineLimit(1)
+
+                        if let desc = tool.description, !desc.isEmpty {
+                            Text(desc)
+                                .scaledFont(size: 12, weight: .medium)
+                                .foregroundStyle(theme.textSecondary)
+                                .lineLimit(2)
+                        }
+                    }
+
+                    Spacer()
+
+                    // Star / quick-pin button
+                    let isPinned = savedQuickPillIds.contains(tool.id)
+                    Button {
+                        toggleQuickPill(tool.id)
+                    } label: {
+                        Image(systemName: isPinned ? "star.fill" : "star")
+                            .scaledFont(size: 14, weight: .medium)
+                            .foregroundStyle(isPinned ? theme.brandPrimary : theme.textTertiary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(isPinned ? "Remove from quick actions" : "Add to quick actions")
+                    .animation(MicroAnimation.snappy, value: isPinned)
+
+                    // Gear icon — only shown when the tool has user-configurable valves
+                    if tool.hasUserValves, let onOpenToolUserValves {
+                        Button {
+                            Haptics.play(.light)
+                            dismiss()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                onOpenToolUserValves(tool.id, tool.isFunctionTool)
+                            }
+                        } label: {
+                            Image(systemName: "slider.horizontal.3")
+                                .scaledFont(size: 15, weight: .medium)
+                                .foregroundStyle(theme.textTertiary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 4)
+                                .background(theme.surfaceContainer.opacity(0.5))
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Configure \(tool.name) valves")
+                    }
+
+                    togglePill(isOn: isSelected)
+                }
+                .padding(Spacing.sm)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(tool.name)
+            .accessibilityValue(isSelected ? "Enabled" : "Disabled")
+            .accessibilityAddTraits(.isToggle)
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(tool.name)
-        .accessibilityValue(isSelected ? "Enabled" : "Disabled")
-        .accessibilityAddTraits(.isToggle)
+        .background(tileBackground(isOn: isSelected))
+        .clipShape(
+            RoundedRectangle(cornerRadius: CornerRadius.input, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: CornerRadius.input, style: .continuous)
+                .strokeBorder(
+                    tileBorderColor(isOn: isSelected),
+                    lineWidth: 0.5
+                )
+        )
     }
 
     // MARK: - Shared Sub-Views

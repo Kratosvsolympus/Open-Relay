@@ -157,12 +157,6 @@ Pull requests are welcome! Whether it's a bug fix, improvement, or new feature �
 
 ---
 
-## 🙏 Acknowledgments
-
-Special thanks to **Conduit by cogwheel** — a cross-platform Open WebUI mobile client and a real inspiration for this project.
-
----
-
 ## 📄 License
 
 This project is licensed under the **GPL License**. See [LICENSE](LICENSE) for details.

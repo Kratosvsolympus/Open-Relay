@@ -10,11 +10,19 @@ enum ChannelSocketEventType: String {
     case channelMessageNew = "channel:message:new"
     case messageUpdate = "message:update"
     case channelMessageUpdate = "channel:message:update"
+    // Delete — server may emit either variant
+    case messageDelete = "message:delete"
     case channelMessageDelete = "channel:message:delete"
+    // Reactions
     case channelReactionAdd = "channel:reaction:add"
     case channelReactionRemove = "channel:reaction:remove"
     case messageReactionAdd = "message:reaction:add"
     case messageReactionRemove = "message:reaction:remove"
+    // Pin / Unpin — server emits these as distinct types
+    case channelMessagePinned = "channel:message:pinned"
+    case channelMessageUnpinned = "channel:message:unpinned"
+    case messagePinned = "message:pinned"
+    case messageUnpinned = "message:unpinned"
     
     /// Returns the matching event type from a raw string, or nil if unknown.
     static func from(_ raw: String?) -> ChannelSocketEventType? {

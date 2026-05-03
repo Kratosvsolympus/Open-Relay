@@ -4,6 +4,8 @@ import SwiftUI
 struct AboutView: View {
     @Bindable var viewModel: AuthViewModel
     @Environment(\.theme) private var theme
+    @Environment(AppDependencyContainer.self) private var dependencies
+    @State private var showUpToDate = false
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
@@ -23,7 +25,8 @@ struct AboutView: View {
                 SettingsSection(header: "App") {
                     detailRow(label: "Version", value: appVersion)
                     detailRow(label: "Build", value: buildNumber)
-                    detailRow(label: "Platform", value: "iOS \(UIDevice.current.systemVersion)", showDivider: false)
+                    detailRow(label: "Platform", value: "iOS \(UIDevice.current.systemVersion)")
+                    checkForUpdatesRow
                 }
 
                 // Server info
@@ -109,6 +112,58 @@ struct AboutView: View {
             .padding(.vertical, Spacing.lg)
         }
         .background(theme.background)
+        .sheet(item: Binding(
+            get: { dependencies.updateChecker.availableUpdate },
+            set: { if $0 == nil { dependencies.updateChecker.dismissUpdate() } }
+        )) { update in
+            UpdateAvailableSheet(
+                update: update,
+                onUpdate: { },
+                onDismiss: { dependencies.updateChecker.dismissUpdate() }
+            )
+            .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+        }
+    }
+
+    // MARK: - Check for Updates Row
+
+    @ViewBuilder
+    private var checkForUpdatesRow: some View {
+        let checker = dependencies.updateChecker
+        VStack(spacing: 0) {
+            Button {
+                Task { await checker.checkForUpdatesManually() }
+                showUpToDate = false
+            } label: {
+                HStack {
+                    Text("Check for Updates")
+                        .scaledFont(size: 14)
+                        .foregroundStyle(theme.textPrimary)
+                    Spacer()
+                    if checker.isChecking {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else if showUpToDate && checker.availableUpdate == nil {
+                        Label("Up to date", systemImage: "checkmark.circle.fill")
+                            .scaledFont(size: 12)
+                            .foregroundStyle(.green)
+                            .labelStyle(.titleAndIcon)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .foregroundStyle(theme.textTertiary)
+                            .scaledFont(size: 14)
+                    }
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.chatBubblePadding)
+            }
+            .disabled(checker.isChecking)
+            .onChange(of: checker.isChecking) { _, isChecking in
+                if !isChecking {
+                    showUpToDate = true
+                }
+            }
+        }
     }
 
     private var appHeader: some View {

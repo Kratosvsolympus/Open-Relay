@@ -2,6 +2,7 @@ import SwiftUI
 import WebKit
 import os.log
 import UniformTypeIdentifiers
+import MarkdownView
 
 private let vizLog = Logger(subsystem: "com.openui", category: "VizPipeline")
 
@@ -1916,20 +1917,31 @@ private struct RichUIWebView: UIViewRepresentable {
 
 // MARK: - Tool Call Result Block View
 
-/// Renders the OUTPUT section as plain scrollable text with lightweight JSON
-/// pretty-printing and character-based truncation to prevent UI freezes on
-/// large results (e.g. web search returning full HTML pages).
+/// Renders the OUTPUT section as a syntax-highlighted code block via MarkdownView.
+/// JSON results are pretty-printed and displayed with JSON syntax highlighting.
+/// All other text is shown as plain monospaced output. The underlying CodeView
+/// uses virtual line windowing — only the visible lines are laid out, matching
+/// the same "only parse what's shown" behaviour as regular markdown code blocks.
 private struct ToolCallResultBlockView: View {
     let content: String
 
-    /// Characters shown before the "Show full output" button appears.
-    private static let truncationThreshold = 2_000
-
-    @State private var showFull: Bool = false
     @Environment(\.theme) private var theme
+    @Environment(\.accessibilityScale) private var accessibilityScale
 
-    /// Lightweight JSON pretty-print — no syntax highlighting, no AttributedString.
-    /// Falls back to the raw string if content is not valid JSON.
+    private static let baseBodyFontSize: CGFloat = UIFont.preferredFont(forTextStyle: .body).pointSize
+
+    /// Builds a MarkdownTheme scaled to the current accessibility text size.
+    private var scaledTheme: MarkdownTheme {
+        let scale = accessibilityScale.scale(for: .content)
+        var t = MarkdownTheme.default
+        if abs(scale - 1.0) > 0.01 {
+            t.align(to: Self.baseBodyFontSize * scale)
+        }
+        return t
+    }
+
+    /// Pretty-prints the content if it is JSON, otherwise returns the raw string.
+    /// Also handles double-encoded JSON strings (e.g. `"\"{ ... }\""` ).
     private var formattedContent: String {
         // Try direct JSON parse
         if let data = content.data(using: .utf8),
@@ -1956,60 +1968,34 @@ private struct ToolCallResultBlockView: View {
         return content
     }
 
-    private var isTruncated: Bool {
-        !showFull && formattedContent.count > Self.truncationThreshold
-    }
-
-    private var displayContent: String {
-        guard isTruncated else { return formattedContent }
-        return String(formattedContent.prefix(Self.truncationThreshold))
+    /// Language hint passed to the code fence. `json` enables syntax highlighting;
+    /// plain text output falls back to an empty language tag (monospaced, no colours).
+    private var codeLanguage: String {
+        guard let data = content.data(using: .utf8),
+              let _ = try? JSONSerialization.jsonObject(with: data) else {
+            // Also accept double-encoded JSON
+            let stripped = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if stripped.hasPrefix("\"") && stripped.hasSuffix("\"") {
+                let inner = String(stripped.dropFirst().dropLast())
+                    .replacingOccurrences(of: "\\\"", with: "\"")
+                    .replacingOccurrences(of: "\\n", with: "\n")
+                    .replacingOccurrences(of: "\\\\", with: "\\")
+                if let d = inner.data(using: .utf8),
+                   let _ = try? JSONSerialization.jsonObject(with: d) {
+                    return "json"
+                }
+            }
+            return ""
+        }
+        return "json"
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ScrollView(.vertical, showsIndicators: true) {
-                // LazyVStack renders one Text per line so SwiftUI only lays out
-                // the lines currently visible — prevents the main-thread stall
-                // that occurs when the entire large string is measured at once.
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    let lines = displayContent.components(separatedBy: "\n")
-                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                        Text(line.isEmpty ? " " : line)
-                            .scaledFont(size: 12, design: .monospaced)
-                            .foregroundStyle(theme.textSecondary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .padding(10)
-            }
-            .frame(maxHeight: 320)
-
-            // Show full / collapse toggle
-            if formattedContent.count > Self.truncationThreshold {
-                Divider()
-                    .overlay(theme.cardBorder.opacity(0.2))
-                Button {
-                    showFull.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: showFull ? "chevron.up" : "chevron.down")
-                            .scaledFont(size: 10, weight: .semibold)
-                        Text(showFull
-                             ? "Collapse"
-                             : "Show full output (\(formattedContent.count.formatted()) chars)")
-                            .scaledFont(size: 11, weight: .medium)
-                    }
-                    .foregroundStyle(theme.textTertiary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(.plain)
-                .background(theme.surfaceContainer.opacity(theme.isDark ? 0.4 : 0.2))
-            }
-        }
-        .background(theme.surfaceContainer.opacity(theme.isDark ? 0.35 : 0.25))
+        MarkdownView(
+            "```\(codeLanguage)\n\(formattedContent)\n```",
+            theme: scaledTheme
+        )
+        .codeBarHidden(true)
         .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous)
@@ -2223,42 +2209,44 @@ struct ToolCallView: View {
     }
 }
 
-// MARK: - Collapsed Tool Call Group
+// MARK: - Mixed Tool Call Group (with interleaved reasoning)
 
-/// Renders a group of consecutive tool calls from the same MCP server as a
-/// collapsible summary row — "Explored N server-name ˅" — matching the Open
-/// WebUI web UI. Tapping the header expands to reveal individual ToolCallViews.
-private struct CollapsedToolCallGroup: View {
-    let calls: [ToolCallData]
+/// Renders a mixed group of tool calls and interleaved reasoning blocks.
+/// Collapsed header: "Explored N tool_a, tool_b ˅" (tools only in the count/label).
+/// Expanded body: renders items in order — tool calls and reasoning blocks inline.
+private struct MixedToolCallGroup: View {
+    let items: [AssistantMessageContent.GroupedItem]
     var authToken: String? = nil
     var serverBaseURL: String? = nil
 
     @State private var isExpanded: Bool = false
     @Environment(\.theme) private var theme
 
-    private var allDone: Bool { calls.allSatisfy(\.isDone) }
+    /// Only the .tool items — used for the count and label in the header.
+    private var toolItems: [ToolCallData] {
+        items.compactMap { if case .tool(let tc) = $0 { return tc }; return nil }
+    }
 
-    /// The group label: a comma-separated list of unique tool names (with
-    /// underscores replaced by spaces), preserving order of first appearance.
-    /// E.g. "web_search, web_search, fetch_page" → "web_search, fetch_page"
+    private var allDone: Bool {
+        // Done when all tool calls are done (reasoning isDone is separate)
+        toolItems.allSatisfy(\.isDone)
+    }
+
+    /// Comma-separated unique tool names (order of first appearance).
     private var groupLabel: String {
         var seen = Set<String>()
         var unique: [String] = []
-        for call in calls {
-            if seen.insert(call.name).inserted {
-                unique.append(call.name)
-            }
+        for tc in toolItems {
+            if seen.insert(tc.name).inserted { unique.append(tc.name) }
         }
         return unique.joined(separator: ", ")
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Summary header (tappable to expand/collapse)
+            // Collapsed summary header
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded.toggle()
-                }
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
             } label: {
                 HStack(spacing: 8) {
                     if allDone {
@@ -2273,7 +2261,7 @@ private struct CollapsedToolCallGroup: View {
 
                     (Text("Explored ")
                         .foregroundStyle(theme.textTertiary)
-                     + Text("\(calls.count) ")
+                     + Text("\(toolItems.count) ")
                         .foregroundStyle(theme.textPrimary)
                         .fontWeight(.semibold)
                      + Text(groupLabel)
@@ -2294,19 +2282,21 @@ private struct CollapsedToolCallGroup: View {
             }
             .buttonStyle(.plain)
 
-            // Expanded: individual tool calls
+            // Expanded: render items in order (tool calls + inline reasoning)
             if isExpanded {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(calls.enumerated()), id: \.offset) { index, call in
-                        if index > 0 {
-                            Divider()
-                                .overlay(Color.primary.opacity(0.07))
+                    ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
+                        switch item {
+                        case .tool(let tc):
+                            if idx > 0 {
+                                Divider().overlay(Color.primary.opacity(0.07))
+                            }
+                            ToolCallView(toolCall: tc, authToken: authToken, serverBaseURL: serverBaseURL)
+                        case .reasoning(let r):
+                            Divider().overlay(Color.primary.opacity(0.07))
+                            ReasoningView(reasoning: r)
+                                .padding(.vertical, Spacing.xs)
                         }
-                        ToolCallView(
-                            toolCall: call,
-                            authToken: authToken,
-                            serverBaseURL: serverBaseURL
-                        )
                     }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -2318,70 +2308,62 @@ private struct CollapsedToolCallGroup: View {
 
 // MARK: - Tool Calls Container
 
-/// Renders a list of tool calls extracted from message content.
-/// Consecutive calls sharing the same MCP server prefix (the part before `__`)
-/// are collapsed into a single expandable summary row, matching the Open WebUI
-/// web UI. Plain tool names with no prefix are grouped by exact name.
+/// Renders a mixed list of tool calls (and optionally interleaved reasoning blocks)
+/// extracted from message content.  All items in one container come from the
+/// same consecutive run in the message — they are collapsed into a single
+/// "Explored N" row matching the Open WebUI web UI behaviour.
 struct ToolCallsContainer: View {
-    let toolCalls: [ToolCallData]
+    /// Mixed items — tool calls and sandwiched reasoning blocks in order.
+    let toolCalls: [AssistantMessageContent.GroupedItem]
     var authToken: String? = nil
     var serverBaseURL: String? = nil
 
-    /// Returns the server prefix for a tool name.
-    /// MCP tool names use `serverName__toolFunction` — we extract `serverName`.
-    /// Plain tool names (no `__`) return the full name unchanged.
+    /// Returns the server prefix for a tool name (for external callers).
     static func serverPrefix(for name: String) -> String {
         guard let separatorRange = name.range(of: "__") else { return name }
         return String(name[name.startIndex..<separatorRange.lowerBound])
     }
 
-    /// Groups all consecutive tool calls into a single group.
-    /// All tool calls in a single `ToolCallsContainer` are already consecutive
-    /// (they come from the same position in the message content), so we treat
-    /// them all as one group — matching the Open WebUI web UI behavior where
-    /// any mix of consecutive tools (e.g. web_search + fetch_page) collapses
-    /// into a single "Explored N tool_a, tool_b" row.
-    private static func subGroupByName(_ calls: [ToolCallData]) -> [[ToolCallData]] {
-        guard !calls.isEmpty else { return [] }
-        return [calls]
+    /// All pure tool-call items (for single-item fast path detection).
+    private var toolOnlyItems: [ToolCallData] {
+        toolCalls.compactMap { if case .tool(let tc) = $0 { return tc }; return nil }
     }
 
     var body: some View {
-        if !toolCalls.isEmpty {
-            let subGroups = Self.subGroupByName(toolCalls)
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(subGroups.enumerated()), id: \.offset) { index, group in
-                    if index > 0 {
-                        Divider()
-                            .overlay(Color.primary.opacity(0.07))
-                            .padding(.horizontal, 12)
-                    }
+        // Empty — nothing to render
+        if toolCalls.isEmpty { return AnyView(EmptyView()) }
 
-                    if group.count == 1 {
-                        // Single call — render flat as before
-                        ToolCallView(
-                            toolCall: group[0],
-                            authToken: authToken,
-                            serverBaseURL: serverBaseURL
-                        )
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 2)
-                    } else {
-                        // Multiple same-name calls — collapsible group
-                        CollapsedToolCallGroup(calls: group, authToken: authToken, serverBaseURL: serverBaseURL)
-                    }
-                }
-            }
-            .background(
-                RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous)
-                    .fill(Color.primary.opacity(0.03))
+        // Single tool call with no embedded reasoning → flat (no collapse header)
+        if toolCalls.count == 1, case .tool(let tc) = toolCalls[0] {
+            return AnyView(
+                ToolCallView(toolCall: tc, authToken: authToken, serverBaseURL: serverBaseURL)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous)
+                            .fill(Color.primary.opacity(0.03))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous))
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous))
         }
+
+        // Multiple items (or single reasoning-only edge case) → collapsed group
+        return AnyView(
+            MixedToolCallGroup(items: toolCalls, authToken: authToken, serverBaseURL: serverBaseURL)
+                .background(
+                    RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous)
+                        .fill(Color.primary.opacity(0.03))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous))
+        )
     }
 }
 
@@ -2566,8 +2548,11 @@ struct AssistantMessageContent: View {
             // is parsed and laid out on every streaming tick.
             let hasVizMarkers = content.contains("@@@VIZ-START")
             let base: [SegmentGroup] = hasVizMarkers ? rawBase.compactMap { group in
-                if case .toolCalls(let calls) = group {
-                    let filtered = calls.filter { $0.name != "render_visualization" }
+                if case .toolCalls(let items) = group {
+                    let filtered = items.filter {
+                        if case .tool(let tc) = $0 { return tc.name != "render_visualization" }
+                        return true  // keep .reasoning items
+                    }
                     return filtered.isEmpty ? nil : .toolCalls(filtered)
                 }
                 return group
@@ -2585,23 +2570,23 @@ struct AssistantMessageContent: View {
             let messageEmbeds = filteredEmbeds
             vizLog.debug("AssistantMessageContent embed inject: filteredEmbeds=\(filteredEmbeds.count), rawMessageEmbeds=\(self.messageEmbeds.count)")
 
-            // Search from the end for the last toolCalls group
+            // Search from the end for the last toolCalls group, and within it
+            // find the last .tool item that has no embeds to attach the embed to.
             var mutableGroups = base
             for i in stride(from: mutableGroups.count - 1, through: 0, by: -1) {
-                if case .toolCalls(var calls) = mutableGroups[i] {
-                    // Find the last call in this group that has no embeds
-                    for j in stride(from: calls.count - 1, through: 0, by: -1) {
-                        if calls[j].embeds.isEmpty {
-                            let tc = calls[j]
-                            calls[j] = ToolCallData(
+                if case .toolCalls(var items) = mutableGroups[i] {
+                    // Walk backwards through items, skipping .reasoning entries
+                    for j in stride(from: items.count - 1, through: 0, by: -1) {
+                        if case .tool(let tc) = items[j], tc.embeds.isEmpty {
+                            items[j] = .tool(ToolCallData(
                                 id: tc.id,
                                 name: tc.name,
                                 arguments: tc.arguments,
                                 result: tc.result,
                                 isDone: tc.isDone,
                                 embeds: messageEmbeds
-                            )
-                            mutableGroups[i] = .toolCalls(calls)
+                            ))
+                            mutableGroups[i] = .toolCalls(items)
                             return mutableGroups
                         }
                     }
@@ -2721,13 +2706,26 @@ struct AssistantMessageContent: View {
         }
     }
 
+    /// An item inside a mixed tool-call group.
+    /// A single "Explored N" container can hold interleaved tool calls and
+    /// reasoning blocks — matching the OpenWebUI web UI where thinking blocks
+    /// that appear between tool calls are collapsed inside the same group.
+    enum GroupedItem {
+        case tool(ToolCallData)
+        case reasoning(ReasoningData)
+    }
+
     /// Groups adjacent segments of the same type for cleaner rendering.
-    /// Adjacent tool calls become a single `toolCalls` group with dividers.
-    /// Adjacent reasoning blocks become a single `reasoningBlocks` group.
-    /// Text segments remain individual.
+    /// Adjacent tool calls become a single `toolCalls` group.
+    /// A reasoning block that appears *between* tool calls is folded into the
+    /// surrounding tool group rather than breaking it into separate rows.
+    /// A reasoning block that is NOT sandwiched between tool calls (e.g. a
+    /// leading think before any tools, or a trailing think after the last tool
+    /// followed by text) stays as its own `reasoningBlocks` group.
+    /// Text segments remain individual and always break a tool group.
     private enum SegmentGroup {
         case text(String)
-        case toolCalls([ToolCallData])
+        case toolCalls([GroupedItem])
         case reasoningBlocks([ReasoningData])
         /// Message-level embeds with no associated tool call to attach to.
         case standaloneEmbeds([String])
@@ -2736,24 +2734,47 @@ struct AssistantMessageContent: View {
     private static func groupSegments(_ segments: [ContentSegment]) -> [SegmentGroup] {
         var groups: [SegmentGroup] = []
 
-        for segment in segments {
+        // Helper: does a reasoning block at index `i` have a tool call after it
+        // (before any intervening text)? Used to decide whether to fold the
+        // reasoning block into a tool group or emit it as standalone.
+        func nextNonReasoningIsToolCall(from i: Int) -> Bool {
+            var j = i + 1
+            while j < segments.count {
+                switch segments[j] {
+                case .toolCall: return true
+                case .reasoning: j += 1   // skip consecutive reasoning blocks
+                case .text: return false
+                }
+            }
+            return false
+        }
+
+        for (index, segment) in segments.enumerated() {
             switch segment {
             case .text(let str):
                 groups.append(.text(str))
 
             case .toolCall(let tc):
-                // Merge with previous group if it's also tool calls
+                // Merge with previous group if it is already a toolCalls group
                 if case .toolCalls(var existing) = groups.last {
                     groups.removeLast()
-                    existing.append(tc)
+                    existing.append(.tool(tc))
                     groups.append(.toolCalls(existing))
                 } else {
-                    groups.append(.toolCalls([tc]))
+                    groups.append(.toolCalls([.tool(tc)]))
                 }
 
             case .reasoning(let r):
-                // Merge with previous group if it's also reasoning
-                if case .reasoningBlocks(var existing) = groups.last {
+                // If the previous group is already a toolCalls group AND the
+                // next non-reasoning segment is another tool call, fold this
+                // reasoning block inside that group (it is "sandwiched").
+                if case .toolCalls(var existing) = groups.last,
+                   nextNonReasoningIsToolCall(from: index) {
+                    groups.removeLast()
+                    existing.append(.reasoning(r))
+                    groups.append(.toolCalls(existing))
+                } else if case .reasoningBlocks(var existing) = groups.last {
+                    // Merge consecutive standalone reasoning blocks
                     groups.removeLast()
                     existing.append(r)
                     groups.append(.reasoningBlocks(existing))

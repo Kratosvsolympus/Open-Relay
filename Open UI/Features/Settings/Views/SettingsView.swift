@@ -361,7 +361,7 @@ struct SettingsView: View {
         if let id = defaultModelId, let model = availableModels.first(where: { $0.id == id }) {
             return model.name
         }
-        return "Auto-select"
+        return "Not set"
     }
 
     private func loadModels() async {
@@ -384,6 +384,8 @@ struct SettingsView: View {
                 let models: [String] = modelId.map { [$0] } ?? []
                 try await api.mergeUserUISettings(["models": models])
                 defaultModelId = modelId
+                // Keep the shared cache in sync so new chats immediately pick up the change.
+                dependencies.activeChatStore.cachedDefaultModelId = modelId
             } catch {}
         }
     }
@@ -436,32 +438,6 @@ struct DefaultModelPickerView: View {
     var body: some View {
         NavigationStack {
             List {
-                // Auto-select option
-                Button {
-                    localSelection = nil
-                } label: {
-                    HStack {
-                        Image(systemName: "wand.and.stars")
-                            .foregroundStyle(theme.brandPrimary)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Auto-select")
-                                .scaledFont(size: 16)
-                                .fontWeight(.semibold)
-                            Text("Use the server default model. ")
-                                .scaledFont(size: 12, weight: .medium)
-                                .foregroundStyle(theme.textTertiary)
-                        }
-                        Spacer()
-                        if localSelection == nil {
-                            Image(systemName: "checkmark")
-                                .foregroundStyle(theme.brandPrimary)
-                        }
-                    }
-                }
-                .listRowBackground(
-                    localSelection == nil ? theme.brandPrimary.opacity(0.08) : Color.clear
-                )
-
                 // Model list
                 ForEach(filteredModels) { model in
                     Button {

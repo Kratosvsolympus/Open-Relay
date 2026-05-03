@@ -39,17 +39,34 @@ struct StreamingMarkdownView: View {
     /// We scale relative to this so the user's content text scale applies correctly.
     private static let baseBodyFontSize: CGFloat = UIFont.preferredFont(forTextStyle: .body).pointSize
 
+    // Bug 16: scaledTheme was recomputed on every render (N times per frame for N segments).
+    // Cache it as @State and only rebuild when accessibilityScale or textColor changes.
+    @State private var cachedTheme: MarkdownTheme = MarkdownTheme.default
+
+    // Bug 1 + 11: Cache resolveSegments / parseSpecialBlocks output.
+    // Content is append-only during streaming, so a changed content string always
+    // means new work is needed. The common 60-fps case is a String == comparison.
+    @State private var cachedSegments: [ContentSegment] = []
+    @State private var cachedSegmentsContent: String = ""
+    @State private var cachedSegmentsIsStreaming: Bool = false
+
     init(content: String, isStreaming: Bool, textColor: SwiftUI.Color? = nil) {
         self.content = content
         self.isStreaming = isStreaming
         self.textColor = textColor
     }
 
-    /// Returns a MarkdownTheme with fonts scaled by the user's accessibility content scale,
-    /// and optionally with the body text color overridden (for rendering on coloured backgrounds
-    /// like the blue "sent" bubble in channels — UIKit-backed MarkdownView ignores SwiftUI
-    /// foregroundStyle, so we must set the color directly in the theme).
-    private var scaledTheme: MarkdownTheme {
+    var body: some View {
+        unifiedBody
+            .onAppear {
+                rebuildThemeIfNeeded()
+            }
+            .onChange(of: accessibilityScale.scale(for: .content)) { _, _ in rebuildThemeIfNeeded() }
+            .onChange(of: textColor) { _, _ in rebuildThemeIfNeeded() }
+    }
+
+    // Bug 16: builds a MarkdownTheme only when the inputs actually change.
+    private func rebuildThemeIfNeeded() {
         let scale = accessibilityScale.scale(for: .content)
         var theme = MarkdownTheme.default
         if abs(scale - 1.0) > 0.01 {
@@ -60,11 +77,7 @@ struct StreamingMarkdownView: View {
             theme.colors.body = uiColor
             theme.colors.code = uiColor
         }
-        return theme
-    }
-
-    var body: some View {
-        unifiedBody
+        cachedTheme = theme
     }
 
     // MARK: - Unified Body
@@ -80,12 +93,28 @@ struct StreamingMarkdownView: View {
         if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             EmptyView()
         } else {
-            let segments = resolveSegments()
+            // Bug 1 + 11: only re-parse when content or isStreaming actually changed.
+            let segments: [ContentSegment] = {
+                if content == cachedSegmentsContent && isStreaming == cachedSegmentsIsStreaming {
+                    return cachedSegments
+                }
+                let result = resolveSegments()
+                // SwiftUI @ViewBuilder bodies cannot mutate @State directly, so
+                // defer the cache write to avoid "mutation during view update" warnings.
+                DispatchQueue.main.async {
+                    if cachedSegmentsContent != content || cachedSegmentsIsStreaming != isStreaming {
+                        cachedSegments = result
+                        cachedSegmentsContent = content
+                        cachedSegmentsIsStreaming = isStreaming
+                    }
+                }
+                return result
+            }()
             if segments.isEmpty {
                 EmptyView()
             } else if segments.count == 1, case .markdown(let text) = segments[0] {
                 // Fast path: plain markdown only — no viz, no ForEach overhead.
-                MarkdownView(text, theme: scaledTheme)
+                MarkdownView(text, theme: cachedTheme)
                     .codeAutoScroll(true)
             } else {
                 VStack(alignment: .leading, spacing: 8) {
@@ -247,14 +276,14 @@ struct StreamingMarkdownView: View {
         switch segment {
         case .markdown(let text):
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                MarkdownView(text, theme: scaledTheme)
+                MarkdownView(text, theme: cachedTheme)
                     .codeAutoScroll(true)
             }
         case .chart(let code):
             if let spec = tryParseChart(code: code) {
                 ChartPreviewView(spec: spec, rawCode: code, language: "json")
             } else {
-                MarkdownView("```json\n\(code)\n```", theme: scaledTheme)
+                MarkdownView("```json\n\(code)\n```", theme: cachedTheme)
             }
         case .html(let code, let streaming):
             HTMLPreviewView(html: code, isStreaming: streaming)

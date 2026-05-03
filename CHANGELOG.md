@@ -1,3 +1,34 @@
+# Changelog
+
+## v3.5 — May 3, 2026
+
+### What's New
+- Added user valve editor for tools — tap the gear icon next to any tool in the tools picker to configure its settings.
+- Added in-app update notice — the app checks for new versions on every launch and shows a sheet with release notes; tapping "Later" dismisses it and leaves an update icon next to the New Chat button in sidebar so you can reopen it anytime.
+- Added star button to every tool in the tools picker — tap ⭐ to instantly pin it as a quick-action pill in the chat input, no settings detour required.
+
+### Improvements
+- Tool call results now display with full syntax highlighting and virtual windowing — only the visible portion is rendered, matching how regular code blocks work.
+- Streaming responses now scroll more smoothly with less jank, reduced CPU usage, and no animation stutter.
+- Dramatically improved performance for reasoning/thinking models — the app no longer gets slower as the model thinks longer.
+- Channel deletes, edits, reactions, and pins from other devices now appear live without needing to refresh.
+- Deleting a channel message now animates out instantly instead of waiting for the server.
+
+### Bug Fixes
+- Fixed TTS audio not playing through earbuds or wired headphones in both chat read-aloud and voice calls.
+- Fixed regenerated responses not showing server errors in the chat bubble
+- Fixed the chat not scrolling to the regenerating message — regenerating a response now animates the view to the new message the same way sending does.
+- Fixed non-toggleable filters incorrectly appearing under Default Filters in the model editor.
+- Fixed toggle-filter functions in the tools picker always turning on when globally enabled, ignoring the model's configured default state.
+- Fixed crash in channels when deleting a message.
+- Fixed channel context menu appearing off-screen when the keyboard was open.
+- Fixed new chats always starting with the last-used model instead of the server-configured default model.
+- Fixed Settings → Default Model changes not applying to new chats opened in the same session.
+- Hidden models (disabled by an admin in OpenWebUI) no longer appear in the model picker or the Default Model setting.
+- Fixed thinking blocks breaking the "Explored N" tool-call grouping on reasoning models — all tool calls now collapse into a single pill as expected.
+
+## Previous Builds
+
 ## v3.4.2 — May 1, 2026
 
 ### Improvements

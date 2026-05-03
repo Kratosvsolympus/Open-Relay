@@ -635,9 +635,11 @@ struct ChannelDetailView: View {
     }
     
     private func shouldShowSenderHeader(at index: Int) -> Bool {
+        let messages = viewModel.messages
+        guard index < messages.count else { return true }
         guard index > 0 else { return true }
-        let current = viewModel.messages[index]
-        let previous = viewModel.messages[index - 1]
+        let current = messages[index]
+        let previous = messages[index - 1]
         if !Calendar.current.isDate(current.createdAt, inSameDayAs: previous.createdAt) {
             return true
         }
@@ -646,6 +648,7 @@ struct ChannelDetailView: View {
     
     private func isLastInGroup(at index: Int) -> Bool {
         let messages = viewModel.messages
+        guard index < messages.count else { return true }
         guard index < messages.count - 1 else { return true }
         let current = messages[index]
         let next = messages[index + 1]
@@ -667,9 +670,11 @@ struct ChannelDetailView: View {
     }
     
     private func shouldShowDateSeparator(at index: Int) -> Bool {
+        let messages = viewModel.messages
+        guard index < messages.count else { return false }
         guard index > 0 else { return true }
-        let current = viewModel.messages[index].createdAt
-        let previous = viewModel.messages[index - 1].createdAt
+        let current = messages[index].createdAt
+        let previous = messages[index - 1].createdAt
         return !Calendar.current.isDate(current, inSameDayAs: previous)
     }
     
@@ -878,6 +883,16 @@ struct ChannelDetailView: View {
             }
         }
         .opacity(message.isOptimistic ? 0.6 : 1.0)
+        // Dismiss the keyboard before the context menu appears so it has the full
+        // screen height available and doesn't appear off-screen.
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.35).onEnded { _ in
+                UIApplication.shared.sendAction(
+                    #selector(UIResponder.resignFirstResponder),
+                    to: nil, from: nil, for: nil
+                )
+            }
+        )
     }
     
     // MARK: - Sender Avatar

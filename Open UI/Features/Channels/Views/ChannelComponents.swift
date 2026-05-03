@@ -708,14 +708,24 @@ struct ThreadDetailSheet: View {
                     CustomMenuButton("Edit", systemImage: "pencil") {
                         viewModel.beginEditing(message: message)
                     }
-                    CustomMenuButton("Delete", systemImage: "trash", role: .destructive) {
+                CustomMenuButton("Delete", systemImage: "trash", role: .destructive) {
                         Task { await viewModel.deleteMessage(id: message.id) }
                     }
                 }
             }
         }
+        // Dismiss the keyboard before the context menu appears so it has the full
+        // screen height available and doesn't appear off-screen.
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.35).onEnded { _ in
+                UIApplication.shared.sendAction(
+                    #selector(UIResponder.resignFirstResponder),
+                    to: nil, from: nil, for: nil
+                )
+            }
+        )
     }
-    
+
     @ViewBuilder
     private func threadAvatar(_ message: ChannelMessage, size: CGFloat) -> some View {
         let isModel = viewModel.isModelMessage(message)
