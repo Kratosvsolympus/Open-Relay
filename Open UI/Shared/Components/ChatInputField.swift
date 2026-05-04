@@ -131,6 +131,10 @@ struct ChatInputField: View {
     /// Called when the tools/overflow sheet is about to appear.
     var onToolsSheetPresented: (() -> Void)?
 
+    /// Called when the user taps the valves gear icon on a tool that has user-configurable valves.
+    /// `id` = tool/function ID, `isFunction` = whether it's a function (vs. a tool).
+    var onOpenToolUserValves: ((String, Bool) -> Void)?
+
     /// Optional custom photo picker view (SwiftUI PhotosPicker).
     var photoPicker: AnyView?
 
@@ -241,7 +245,8 @@ struct ChatInputField: View {
                 onCameraCapture: onCameraCapture,
                 onWebAttachment: onWebAttachment,
                 onReferenceChatAttachment: onReferenceChatAttachment,
-                photoPicker: photoPicker
+                photoPicker: photoPicker,
+                onOpenToolUserValves: onOpenToolUserValves
             )
         }
         .onChange(of: showToolsSheet) { _, isPresented in

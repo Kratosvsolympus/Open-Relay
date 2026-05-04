@@ -1561,6 +1561,21 @@ struct iPadSidebarContent: View {
 
                 Spacer()
 
+                // Update available icon — only visible when an update is pending
+                if dependencies.updateChecker.pendingUpdate != nil {
+                    Button {
+                        dependencies.updateChecker.reopenUpdate()
+                    } label: {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .scaledFont(size: 15, weight: .medium)
+                            .foregroundStyle(.tint)
+                            .frame(width: 36, height: 36)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Update Available")
+                    .transition(.scale.combined(with: .opacity))
+                }
+
                 // New Chat — primary action, always visible
                 Button(action: onNewChat) {
                     Image(systemName: "square.and.pencil")

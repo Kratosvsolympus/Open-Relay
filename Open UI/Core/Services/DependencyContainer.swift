@@ -40,7 +40,11 @@ final class ActiveChatStore {
     /// Updated by the first VM that loads models.
     var cachedModels: [AIModel] = []
 
-    /// The last-selected model ID, carried forward to new chats.
+    /// The server-configured default model ID (from `ui.models[0]`).
+    /// Populated after the first model fetch; used for all new chats.
+    var cachedDefaultModelId: String?
+
+    /// The last-selected model ID, carried forward only to existing chats.
     var cachedSelectedModelId: String?
 
     /// Server task config shared with all ChatViewModels.
@@ -89,7 +93,13 @@ final class ActiveChatStore {
         // Pre-populate from shared cache so UI is instant
         if !cachedModels.isEmpty {
             vm.availableModels = cachedModels
-            vm.selectedModelId = cachedSelectedModelId ?? cachedModels.first?.id
+            if conversationId == nil {
+                // New chat: always start with server default model, not the last-used one
+                vm.selectedModelId = cachedDefaultModelId ?? cachedModels.first?.id
+            } else {
+                // Existing chat: restore the last-used model (overridden by loadConversation)
+                vm.selectedModelId = cachedSelectedModelId ?? cachedDefaultModelId ?? cachedModels.first?.id
+            }
         }
         viewModels[key] = vm
         accessOrder.append(key)
@@ -234,6 +244,10 @@ final class AppDependencyContainer: ServiceContainer {
     /// watches NWPathMonitor, and exposes an observable `connectionState`
     /// used by ``ConnectionOverlayView``.
     let connectionMonitor = ServerConnectionMonitor()
+
+    /// Checks GitHub releases for newer versions of Open Relay and
+    /// surfaces an update notice to the user when one is found.
+    let updateChecker = UpdateChecker()
 
     /// Whether the server is currently reachable (delegated to connection monitor).
     var isServerReachable: Bool {

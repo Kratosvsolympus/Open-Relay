@@ -383,14 +383,10 @@ final class APIClient: @unchecked Sendable {
             let settings = try await getUserSettings()
             if let ui = settings["ui"] as? [String: Any],
                let models = ui["models"] as? [String],
-               let first = models.first {
+               let first = models.first, !first.isEmpty {
                 return first
             }
         } catch {}
-
-        if let models = try? await getModels(), let first = models.first {
-            return first.id
-        }
         return nil
     }
 
@@ -2259,6 +2255,41 @@ final class APIClient: @unchecked Sendable {
         return json
     }
 
+    /// GET /api/v1/tools/id/{id}/valves/user — returns the current user-level valve values.
+    func getToolUserValves(id: String) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/id/\(id)/valves/user", timeout: 300)
+        guard !data.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return json
+    }
+
+    /// GET /api/v1/tools/id/{id}/valves/user/spec — returns JSON schema for user-level valves.
+    func getToolUserValvesSpecOrdered(id: String) async throws -> ([String: Any], [String]) {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/id/\(id)/valves/user/spec", timeout: 300)
+        guard !data.isEmpty else { return ([:], []) }
+        let spec = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        let keyOrder = extractPropertyKeyOrder(from: data)
+        return (spec, keyOrder)
+    }
+
+    /// POST /api/v1/tools/id/{id}/valves/user/update — saves user-level valve overrides.
+    @discardableResult
+    func updateToolUserValves(id: String, values: [String: Any]) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/tools/id/\(id)/valves/user/update",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: values),
+            timeout: 300
+        )
+        guard !data.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return json
+    }
+
     /// POST /api/v1/tools/load/url — import a tool from a remote URL
     func loadToolFromURL(url: String) async throws -> [String: Any] {
         return try await network.requestJSON(
@@ -2445,6 +2476,42 @@ final class APIClient: @unchecked Sendable {
     func updateFunctionValves(id: String, values: [String: Any]) async throws -> [String: Any] {
         let (data, _) = try await network.requestRaw(
             path: "/api/v1/functions/id/\(id)/valves/update",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: values)
+        )
+        guard !data.isEmpty,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return values
+        }
+        return json
+    }
+
+    /// GET /api/v1/functions/id/{id}/valves/user — returns the current user-level valve values.
+    func getFunctionUserValves(id: String) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/functions/id/\(id)/valves/user", timeout: 300)
+        guard !data.isEmpty,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return json
+    }
+
+    /// GET /api/v1/functions/id/{id}/valves/user/spec — returns JSON schema for user-level valves, with insertion-order key preservation.
+    func getFunctionUserValvesSpecOrdered(id: String) async throws -> ([String: Any], [String]) {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/functions/id/\(id)/valves/user/spec", timeout: 300)
+        guard !data.isEmpty else { return ([:], []) }
+        let orderedKeys = extractPropertyKeyOrder(from: data)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ([:], [])
+        }
+        return (json, orderedKeys)
+    }
+
+    /// POST /api/v1/functions/id/{id}/valves/user/update — saves user-level valve overrides.
+    @discardableResult
+    func updateFunctionUserValves(id: String, values: [String: Any]) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/functions/id/\(id)/valves/user/update",
             method: .post,
             body: try JSONSerialization.data(withJSONObject: values)
         )
@@ -3268,6 +3335,13 @@ final class APIClient: @unchecked Sendable {
         return models.compactMap { raw -> AIModel? in
             guard let id = raw["id"] as? String else { return nil }
             let name = raw["name"] as? String ?? id
+
+            // Skip models hidden by the admin (info.meta.hidden == true)
+            if let info = raw["info"] as? [String: Any],
+               let meta = info["meta"] as? [String: Any],
+               meta["hidden"] as? Bool == true {
+                return nil
+            }
 
             var isMultimodal = false
             var supportsRAG = false

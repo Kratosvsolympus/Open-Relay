@@ -152,6 +152,20 @@ final class ToolsManager {
         return try await apiClient.updateToolValves(id: id, values: values)
     }
 
+    // MARK: - User Valves (per-user overrides)
+
+    func getUserValves(id: String) async throws -> [String: Any] {
+        return try await apiClient.getToolUserValves(id: id)
+    }
+
+    func getUserValvesSpecWithOrder(id: String) async throws -> ([String: Any], [String]) {
+        return try await apiClient.getToolUserValvesSpecOrdered(id: id)
+    }
+
+    func updateUserValves(id: String, values: [String: Any]) async throws -> [String: Any] {
+        return try await apiClient.updateToolUserValves(id: id, values: values)
+    }
+
     // MARK: - Import from URL
 
     func loadFromURL(url: String) async throws -> ToolDetail? {

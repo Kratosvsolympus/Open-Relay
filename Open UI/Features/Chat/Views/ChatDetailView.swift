@@ -6,6 +6,18 @@ import QuickLook
 import MarkdownView
 import os.log
 
+// MARK: - Scroll Refs (Bug 9)
+
+/// Reference box for high-frequency scroll-tracking values.
+/// Stored as a plain `final class` so writes from `onScrollGeometryChange`
+/// and `onChange` closures never trigger a SwiftUI body re-evaluation —
+/// unlike `@State`, property mutations on a reference type are invisible to
+/// the observation system.
+private final class ScrollRefs {
+    var lastScrollOffset: CGFloat = 0
+    var lastProgrammaticScrollTime: Date = .distantPast
+}
+
 // MARK: - Chat Detail View
 
 struct ChatDetailView: View {
@@ -32,16 +44,16 @@ struct ChatDetailView: View {
     /// True when the user has manually scrolled away from the bottom.
     @State private var isScrolledUp = false
     /// Last known contentOffset.y — used to detect user-initiated upward drags.
-    @State private var lastScrollOffset: CGFloat = 0
     /// Cached scroll content height — updated via a separate onScrollGeometryChange.
     @State private var viewState_contentHeight: CGFloat = 0
     /// Cached scroll container height — updated via a separate onScrollGeometryChange.
     @State private var viewState_containerHeight: CGFloat = 0
-    /// Timestamp of the last *programmatic* scroll-to-bottom.
-    /// Used both as a streaming throttle guard (prevent pump-scroll more than 10hz)
-    /// and as a suppressor to prevent the offset-change handler from falsely
-    /// interpreting a programmatic scroll animation as a manual upward drag.
-    @State private var lastProgrammaticScrollTime: Date = .distantPast
+    // Bug 9: lastScrollOffset and lastProgrammaticScrollTime are written at scroll
+    // velocity (~60 fps) inside geometry-change callbacks, but they are never
+    // rendered in body. Storing them as @State would schedule a ChatDetailView body
+    // re-evaluation on every write. Using a reference box means mutations are direct
+    // property stores — zero SwiftUI invalidation overhead.
+    @State private var _scrollRefs = ScrollRefs()
 
     // MARK: Message pagination (sliding window — memory optimization)
     /// The ending index (exclusive) of the visible message window.
@@ -98,6 +110,9 @@ struct ChatDetailView: View {
     /// When set, the assistant displays this overridden content instead.
     @State private var assistantContentOverride: [String: String] = [:]
 
+    // Bug 10: cached indexMap rebuilt only when message count changes.
+    @State private var cachedIndexMap: [String: Int] = [:]
+
     // MARK: Dictation
     @State private var isDictating = false
 
@@ -125,6 +140,8 @@ struct ChatDetailView: View {
     @State private var downloadErrorMessage = ""
     /// URL for QuickLook in-app file preview (PDF, images, docs, etc.)
     @State private var previewFileURL: URL?
+    /// User-valves sheet: set to a .tool(id) or .function(id) to present UserValvesSheet.
+    @State private var toolUserValvesKind: UserValvesKind?
     /// Code preview from MarkdownView's eye button (fullscreen code view)
     @State private var codePreviewCode: String?
     @State private var codePreviewLanguage: String = ""
@@ -408,6 +425,11 @@ struct ChatDetailView: View {
         )
         .sheet(item: $downloadedFileURL) { url in
             ShareSheetView(activityItems: [url])
+        }
+        // User-configurable valves sheet (gear icon on tool rows in ToolsMenuSheet)
+        .sheet(item: $toolUserValvesKind) { kind in
+            UserValvesSheet(kind: kind)
+                .themed()
         }
         // In-app file preview using QuickLook (PDFs, images, docs, etc.)
         .quickLookPreview($previewFileURL)
@@ -835,6 +857,9 @@ struct ChatDetailView: View {
                 dictationService: dependencies.dictationService,
                 onToolsSheetPresented: {
                     Task { await viewModel.loadTools() }
+                },
+                onOpenToolUserValves: { id, isFunction in
+                    toolUserValvesKind = isFunction ? .function(id) : .tool(id)
                 }
             )
         }
@@ -977,12 +1002,18 @@ struct ChatDetailView: View {
             // bring the new message into view. Re-engage auto-scroll so the
             // response streams in below it.
             isScrolledUp = false
-            lastProgrammaticScrollTime = Date()
+            _scrollRefs.lastProgrammaticScrollTime = Date()
 
             if old == 0 {
-                // First message in a new chat — smooth ease-out.
-                withAnimation(.easeOut(duration: 0.3)) {
-                    scrollPosition.scrollTo(edge: .bottom)
+                // Bug 17: Delay first-message scroll by 250 ms so the welcome view's
+                // 200 ms opacity-out transition finishes before we animate to .bottom.
+                // Without the delay the scroll target moves mid-animation (welcome view
+                // collapses) causing a visible content jump.
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        scrollPosition.scrollTo(edge: .bottom)
+                    }
                 }
             } else if keyboard.isVisible {
                 // Keyboard is open — dismiss it first so its collapsing
@@ -993,7 +1024,7 @@ struct ChatDetailView: View {
                     #selector(UIResponder.resignFirstResponder),
                     to: nil, from: nil, for: nil)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    lastProgrammaticScrollTime = Date()
+                    _scrollRefs.lastProgrammaticScrollTime = Date()
                     withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
                         scrollPosition.scrollTo(edge: .bottom)
                     }
@@ -1009,8 +1040,13 @@ struct ChatDetailView: View {
         // if the user is already near the bottom. If they've manually
         // scrolled up, respect that position and don't yank them back.
         .onChange(of: viewModel.isStreaming) { _, streaming in
-            if streaming && !isScrolledUp {
-                // Already at bottom — ensure auto-scroll stays active.
+            if streaming {
+                // Streaming just started — always reset auto-scroll so the
+                // response streams in from the bottom, regardless of whether
+                // the user had previously scrolled up. Only a manual drag
+                // during the active stream should re-enable the FAB.
+                isScrolledUp = false
+                _scrollRefs.lastProgrammaticScrollTime = Date()
                 scrollPosition.scrollTo(edge: .bottom)
             }
         }
@@ -1020,6 +1056,19 @@ struct ChatDetailView: View {
         .onChange(of: isScrolledUp) { oldValue, newValue in
             if oldValue == true && newValue == false && viewModel.isStreaming {
                 scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
+        // Regenerate scroll: force-scroll to bottom whenever a regeneration begins,
+        // regardless of whether the user has scrolled up. This ensures the regenerating
+        // message is always visible — identical behaviour to sending a new message.
+        .onChange(of: viewModel.regenerateScrollToken) { _, _ in
+            isScrolledUp = false
+            _scrollRefs.lastProgrammaticScrollTime = Date()
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 60_000_000) // 60ms layout settle
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
             }
         }
     }
@@ -1057,7 +1106,7 @@ struct ChatDetailView: View {
                 // scroll. The scroll animation itself causes the offset to momentarily
                 // move in various directions, which would otherwise trigger
                 // isScrolledUp = true and break auto-scroll for streaming.
-                let timeSinceProgrammatic = Date().timeIntervalSince(lastProgrammaticScrollTime)
+                let timeSinceProgrammatic = Date().timeIntervalSince(_scrollRefs.lastProgrammaticScrollTime)
                 // During streaming the scroll pump fires every 0.1 s, so we use a
                 // shorter suppression window (0.15 s) to still catch animation bounce
                 // from each pump cycle, while giving the user a window to register
@@ -1066,7 +1115,7 @@ struct ChatDetailView: View {
                 // A strong upward drag (>30 pt in one callback) is unambiguously
                 // intentional — bypass the time guard entirely so it registers
                 // immediately even during the 0.1 s scroll-pump interval.
-                let dragDelta = lastScrollOffset - newOffset.y  // positive = upward
+                let dragDelta = _scrollRefs.lastScrollOffset - newOffset.y  // positive = upward
                 let isStrongDrag = dragDelta > 30
                 if !isStrongDrag {
                     guard timeSinceProgrammatic > suppressionWindow else { return }
@@ -1077,12 +1126,12 @@ struct ChatDetailView: View {
                 // Outside of streaming, require a small but intentional drag (8pt)
                 // to avoid accidental break-out from bounce/inertia.
                 let threshold: CGFloat = viewModel.isStreaming ? 2 : 8
-                if newOffset.y < lastScrollOffset - threshold {
+                if newOffset.y < _scrollRefs.lastScrollOffset - threshold {
                     if !isScrolledUp { isScrolledUp = true }
                 }
             }
-            if abs(newOffset.y - lastScrollOffset) > 2 {
-                lastScrollOffset = newOffset.y
+            if abs(newOffset.y - _scrollRefs.lastScrollOffset) > 2 {
+                _scrollRefs.lastScrollOffset = newOffset.y
             }
 
             // ── Sliding window: load older messages when near the top ──
@@ -1094,6 +1143,9 @@ struct ChatDetailView: View {
                !isLoadingMoreMessages,
                effectiveStart > 0,
                !viewModel.isLoadingConversation {
+                // Bug 12: set isLoadingMoreMessages = true synchronously BEFORE the
+                // async dispatch so the streaming scroll handler sees it immediately
+                // and skips the bottom-scroll that would race with the anchor scroll.
                 isLoadingMoreMessages = true
                 let anchorId = viewModel.messages[effectiveStart].id
                 let slideBy = min(5, effectiveStart)
@@ -1146,13 +1198,14 @@ struct ChatDetailView: View {
             // and the user hasn't scrolled up, animate to the bottom so new
             // content slides in smoothly instead of snapping.
             let grew = newSize.width > oldContentHeight + 1
-            if grew && viewModel.isStreaming && !isScrolledUp {
+            if grew && viewModel.isStreaming && !isScrolledUp && !isLoadingMoreMessages {
                 let now = Date()
-                if now.timeIntervalSince(lastProgrammaticScrollTime) > 0.2 {
-                    lastProgrammaticScrollTime = now
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        scrollPosition.scrollTo(edge: .bottom)
-                    }
+                // Bug 4: Remove the withAnimation wrapper — overlapping 0.15 s animations
+                // launched every 0.2 s fight each other and produce pogo-stick stutter.
+                // defaultScrollAnchor(.bottom) + scrollTo(edge:) handles momentum natively.
+                if now.timeIntervalSince(_scrollRefs.lastProgrammaticScrollTime) > 0.2 {
+                    _scrollRefs.lastProgrammaticScrollTime = now
+                    scrollPosition.scrollTo(edge: .bottom)
                 }
             }
         }
@@ -1240,8 +1293,14 @@ struct ChatDetailView: View {
         let hasMoreAbove = effectiveStart > 0
         let hasMoreBelow = clampedEnd < total
 
-        let indexMap = Dictionary(allMessages.enumerated().map { ($1.id, $0) },
-                                  uniquingKeysWith: { first, _ in first })
+        // Bug 10: indexMap was rebuilt (O(n) allocation) on every messagesList evaluation.
+        // Cache it as a @State dictionary, only rebuilt when the message count changes
+        // (messages are append-only so indices are stable until a deletion).
+        if cachedIndexMap.isEmpty || cachedIndexMap.count != total {
+            cachedIndexMap = Dictionary(allMessages.enumerated().map { ($1.id, $0) },
+                                        uniquingKeysWith: { first, _ in first })
+        }
+        let indexMap = cachedIndexMap
 
         // Split point: index of the last user message *within the visible slice*.
         // Everything from here to the end is the "last turn".
@@ -1308,9 +1367,16 @@ struct ChatDetailView: View {
 
             // ── Streaming status indicators ──
             if message.role == .assistant {
+                // Bug 13: compute isActiveStore once here so each IsolatedStreamingStatus
+                // instance receives it as a plain Bool. Non-active instances never read
+                // any streamingStore properties in their body, making them completely
+                // inert during token delivery.
+                let isActiveStatus = viewModel.streamingStore.streamingMessageId == message.id
+                    && viewModel.streamingStore.isActive
                 IsolatedStreamingStatus(
                     streamingStore: viewModel.streamingStore,
-                    message: message
+                    message: message,
+                    isActiveStore: isActiveStatus
                 )
             }
 
@@ -1834,6 +1900,7 @@ struct ChatDetailView: View {
                     #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
             }
         }
+        .background(ScrollViewHorizontalLock())
         .scrollDismissesKeyboard(.interactively)
     }
 
@@ -3299,10 +3366,11 @@ for item in items {
 private struct IsolatedStreamingStatus: View {
     let streamingStore: StreamingContentStore
     let message: ChatMessage
+    /// Bug 13: pre-computed in the parent so non-active instances never read
+    /// streamingStore properties in body → zero observation subscription overhead.
+    let isActiveStore: Bool
 
     var body: some View {
-        let isActiveStore = streamingStore.streamingMessageId == message.id
-            && streamingStore.isActive
         let effectiveStatusHistory = isActiveStore
             ? streamingStore.streamingStatusHistory
             : message.statusHistory
@@ -3405,13 +3473,20 @@ private struct IsolatedAssistantMessage: View {
             // liveTextTail — the small prose that the user is currently reading —
             // is passed to a lightweight standalone StreamingMarkdownView so only
             // the handful of characters that changed this tick are re-rendered.
-            let frozenBoundary = isActivelyStreaming ? streamingStore.frozenToolBoundaryOffset : 0
-            // Only use the split-render path when the live tail is plain text.
-            // VIZ markers (@@@VIZ-START) and <details blocks require AssistantMessageContent's
-            // full routing (InlineVisualizerView, tool-call renderer, embed injection).
-            // When those are present, fall through to the normal full-content path below.
+            // Combined frozen boundary: max of tool_calls and reasoning close offsets.
+            // Reasoning blocks (thinking) now get their own frozen boundary so the
+            // potentially 50,000+ char reasoning HTML is never re-parsed once closed.
+            let frozenBoundary = isActivelyStreaming
+                ? max(streamingStore.frozenToolBoundaryOffset, streamingStore.frozenReasoningBoundaryOffset)
+                : 0
+            // Only block the split-render path for content that AssistantMessageContent
+            // must handle: VIZ markers and *unclosed* <details blocks.
+            // Closed reasoning blocks (frozenReasoningBoundaryOffset > 0) are already
+            // frozen and appear only in the non-changing `frozenContent` half — they
+            // do NOT require full routing and must NOT block the efficient split path.
             let liveTail = isActivelyStreaming ? streamingStore.liveTextTail : ""
-            let liveTailHasSpecialContent = liveTail.contains("@@@VIZ-START") || liveTail.contains("<details")
+            let liveTailHasSpecialContent = liveTail.contains("@@@VIZ-START")
+                || (liveTail.contains("<details") && !liveTail.contains("</details>"))
             if frozenBoundary > 0 && !liveTailHasSpecialContent {
                 let dc = streamingStore.displayContent
                 let frozenContent: String = {
@@ -3880,8 +3955,11 @@ private struct ScrollViewHorizontalLock: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
-        // Re-attach if the scroll view was recreated
-        if context.coordinator.observedScrollView == nil {
+        // Bug 14: guard with isAttachPending so a rapid second updateUIView call
+        // (which also passes the nil-check) cannot schedule a second attach() and
+        // install duplicate KVO observers + gesture recognizers.
+        if context.coordinator.observedScrollView == nil && !context.coordinator.isAttachPending {
+            context.coordinator.isAttachPending = true
             DispatchQueue.main.async {
                 context.coordinator.attach(to: uiView)
             }
@@ -3896,8 +3974,12 @@ private struct ScrollViewHorizontalLock: UIViewRepresentable {
         private var observation: NSKeyValueObservation?
         weak var observedScrollView: UIScrollView?
         private var panBlocker: UIPanGestureRecognizer?
+        /// Bug 14: set to true synchronously in updateUIView before the async
+        /// dispatch so a concurrent updateUIView cannot schedule a second attach().
+        var isAttachPending: Bool = false
 
         func attach(to view: UIView) {
+            isAttachPending = false
             guard observedScrollView == nil else { return }
             var current: UIView? = view.superview
             while let sv = current {
@@ -3909,11 +3991,12 @@ private struct ScrollViewHorizontalLock: UIViewRepresentable {
                     scrollView.showsHorizontalScrollIndicator = false
                     scrollView.isDirectionalLockEnabled = true
 
-                    // KVO: snap contentOffset.x to 0 on every change
+                    // Bug 3: KVO snaps contentOffset.x to 0.
+                    // Threshold raised from 0.5 pt to 2 pt to avoid false positives
+                    // from floating-point rounding during programmatic scroll animations.
                     observation = scrollView.observe(\.contentOffset, options: [.new]) { [weak self] sv, change in
                         guard self != nil, let offset = change.newValue else { return }
-                        if abs(offset.x) > 0.5 {
-                            // Use setContentOffset to avoid triggering another KVO notification loop
+                        if abs(offset.x) > 2 {
                             sv.contentOffset = CGPoint(x: 0, y: offset.y)
                         }
                     }

@@ -93,7 +93,7 @@ struct ModelEditorView: View {
     @State private var defaultFilterIds: Set<String> = []
     @State private var selectedActionIds: Set<String> = []
     @State private var allTools: [(id: String, name: String)] = []
-    @State private var allFilters: [(id: String, name: String, isGlobal: Bool)] = []
+    @State private var allFilters: [(id: String, name: String, isGlobal: Bool, hasToggle: Bool)] = []
     @State private var allActions: [(id: String, name: String)] = []
     /// Action-type functions (type == "action") with global/active state.
     /// Used for the "Actions" section with global lock support.
@@ -1006,8 +1006,10 @@ struct ModelEditorView: View {
                     .padding(.horizontal, 4)
                 }
 
-                // Default Filters — only shows filters that are currently selected above
-                let checkedFilters = allFilters.filter { selectedFilterIds.contains($0.id) }
+                // Default Filters — only shows toggleable filters that are currently selected above.
+                // Non-toggle filters (no meta.toggle) are always-on once selected; there is no
+                // per-message default state to configure for them.
+                let checkedFilters = allFilters.filter { selectedFilterIds.contains($0.id) && $0.hasToggle }
                 if !checkedFilters.isEmpty {
                     sectionHeader("Default Filters")
                     fieldCard {
@@ -1420,7 +1422,7 @@ struct ModelEditorView: View {
             let functions = try await api.getFunctions()
             allFilters = functions
                 .filter { $0.type == "filter" }
-                .map { (id: $0.id, name: $0.name, isGlobal: $0.isGlobal) }
+                .map { (id: $0.id, name: $0.name, isGlobal: $0.isGlobal, hasToggle: $0.hasToggle) }
             logger.info("[ToolsFunctions] Fetched \(allFilters.count) filters from functions")
 
             // Pre-select global filters (always enabled, non-editable)
@@ -2514,7 +2516,7 @@ struct ModelToolsAndCapabilitiesSection: View {
     @Binding var selectedActionFunctionIds: Set<String>
     @Binding var selectedFilterIds: Set<String>
     @Binding var defaultFilterIds: Set<String>
-    @Binding var allFilters: [(id: String, name: String, isGlobal: Bool)]
+    @Binding var allFilters: [(id: String, name: String, isGlobal: Bool, hasToggle: Bool)]
 
     // Capabilities
     @Binding var capVision: Bool
@@ -2684,7 +2686,8 @@ struct ModelToolsAndCapabilitiesSection: View {
                     }
                     .padding(.vertical, 4).padding(.horizontal, 4)
                 }
-                let checkedFilters = allFilters.filter { selectedFilterIds.contains($0.id) }
+                // Only toggleable filters can have a meaningful "default on/off" state.
+                let checkedFilters = allFilters.filter { selectedFilterIds.contains($0.id) && $0.hasToggle }
                 if !checkedFilters.isEmpty {
                     sectionHeader("Default Filters")
                     fieldCard {

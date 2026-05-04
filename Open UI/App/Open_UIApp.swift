@@ -526,6 +526,26 @@ struct RootView: View {
             // This begins NWPathMonitor + /health polling.
             dependencies.startServerConnectionMonitor()
         }
+        .task {
+            // Check for app updates from GitHub releases.
+            // Runs once after authentication; throttled to at most once every 6 hours.
+            await dependencies.updateChecker.checkForUpdates()
+        }
+        .sheet(item: Binding(
+            get: { dependencies.updateChecker.availableUpdate },
+            set: { if $0 == nil { dependencies.updateChecker.dismissUpdate() } }
+        )) { update in
+            UpdateAvailableSheet(
+                update: update,
+                onUpdate: {
+                    // Sheet's own button opens the App Store — nothing extra needed here
+                },
+                onDismiss: {
+                    dependencies.updateChecker.dismissUpdate()
+                }
+            )
+            .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+        }
         .overlay(alignment: .topTrailing) {
             // Floating pill shown when voice call is minimized.
             // Compact 56×56 square anchored top-right — no Spacer/drag so

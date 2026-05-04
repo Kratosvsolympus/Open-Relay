@@ -535,15 +535,18 @@ final class TextToSpeechService: NSObject {
         let voiceId = serverVoiceId ?? serverDefaultVoice
         let speakerOverride = speakerOverrideEnabled
 
-        // Configure audio session before starting the player
+        // Configure audio session before starting the player.
+        // Voice call (.playAndRecord .voiceChat) keeps the mic alive; port routing is
+        // applied by VoiceCallViewModel.applySpeakerOverride() — don't force it here.
+        // Chat read-aloud (.playback) needs .allowBluetoothA2DP so A2DP earbuds receive
+        // audio after any prior HFP session (which disables A2DP without this option).
         let session = AVAudioSession.sharedInstance()
         if speakerOverride {
-            try? session.setCategory(.playAndRecord, mode: .default,
-                                     options: [.defaultToSpeaker, .allowBluetoothA2DP])
+            try? session.setCategory(.playAndRecord, mode: .voiceChat,
+                                     options: [.allowBluetoothHFP, .allowBluetoothA2DP])
             try? session.setActive(true)
-            try? session.overrideOutputAudioPort(.speaker)
         } else {
-            try? session.setCategory(.playback, mode: .default)
+            try? session.setCategory(.playback, mode: .default, options: [.allowBluetoothA2DP])
             try? session.setActive(true)
         }
 
@@ -720,14 +723,16 @@ final class TextToSpeechService: NSObject {
         do {
             let session = AVAudioSession.sharedInstance()
             if speakerOverrideEnabled {
-                // Voice call — keep mic+speaker active and force loudspeaker
+                // Voice call — keep mic+speaker active; port routing is applied by
+                // VoiceCallViewModel.applySpeakerOverride() so don't force-override here.
+                // .allowBluetoothHFP is required so BT HFP headsets stay connected.
                 try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                        options: [.defaultToSpeaker, .allowBluetoothA2DP])
+                                        options: [.allowBluetoothHFP, .allowBluetoothA2DP])
                 try session.setActive(true)
-                try session.overrideOutputAudioPort(.speaker)
             } else {
-                // Regular read-aloud — use playback mode which routes to loudspeaker by default
-                try session.setCategory(.playback, mode: .default)
+                // Regular read-aloud — .allowBluetoothA2DP ensures A2DP earbuds receive audio
+                // even when a prior session used HFP mode (which disables A2DP by default).
+                try session.setCategory(.playback, mode: .default, options: [.allowBluetoothA2DP])
                 try session.setActive(true)
             }
         } catch {

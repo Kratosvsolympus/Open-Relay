@@ -65,6 +65,8 @@ final class ChatViewModel {
     /// Populated from the server on load and updated in real-time during streaming.
     var tasks: [ChatTask] = []
     var errorMessage: String?
+    /// Bumped each time a regenerate begins. Observed by ChatDetailView to trigger scroll-to-bottom.
+    var regenerateScrollToken: UUID = UUID()
     var inputText: String = ""
     var attachments: [ChatAttachment] = []
     var webSearchEnabled: Bool = false {
@@ -1498,12 +1500,15 @@ final class ChatViewModel {
         isLoadingModels = true
         do {
             availableModels = try await manager.fetchModels()
+            // Always fetch the server default model and cache it.
+            // This ensures new chats always use the server-configured default,
+            // not whatever model the user last switched to in a different chat.
+            let serverDefault = await manager.fetchDefaultModel()
+            if let store = activeChatStore {
+                store.cachedDefaultModelId = serverDefault
+            }
             if selectedModelId == nil {
-                if let def = await manager.fetchDefaultModel() {
-                    selectedModelId = def
-                } else {
-                    selectedModelId = availableModels.first?.id
-                }
+                selectedModelId = serverDefault ?? availableModels.first?.id
             }
             // Write back to shared cache so subsequent VMs are pre-populated
             activeChatStore?.updateModelCache(models: availableModels, selectedId: selectedModelId)
@@ -1566,14 +1571,31 @@ final class ChatViewModel {
             do {
                 let functions = try await manager.apiClient.getFunctions()
                 let toggleFilters = functions.filter { $0.type == "filter" && $0.isActive && $0.hasToggle }
+                // Resolve defaultFilterIds from rawModelItem["info"]["meta"]["defaultFilterIds"].
+                // This is where the web UI stores the per-chat toggle default for filter functions.
+                let modelDefaultFilterIds: [String] = {
+                    guard let raw = selectedModel?.rawModelItem,
+                          let info = raw["info"] as? [String: Any],
+                          let meta = info["meta"] as? [String: Any],
+                          let ids = meta["defaultFilterIds"] as? [String] else { return [] }
+                    return ids
+                }()
+
                 for fn in toggleFilters {
                     // Avoid duplicates (a filter could theoretically have the same ID as a tool)
                     if !allItems.contains(where: { $0.id == fn.id }) {
+                        // Default ON state: use the model's defaultFilterIds list.
+                        // An empty list means the admin left the default as OFF — respect that.
+                        // isGlobal only controls whether the filter pipeline runs for all models;
+                        // it is NOT the chat-UI toggle default and must NOT be used here.
+                        let isDefaultOn = modelDefaultFilterIds.contains(fn.id)
                         allItems.append(ToolItem(
                             id: fn.id,
                             name: fn.name,
                             description: fn.description.isEmpty ? nil : fn.description,
-                            isEnabled: fn.isGlobal // Global toggle-filters are enabled by default
+                            isEnabled: isDefaultOn,
+                            hasUserValves: true,
+                            isFunctionTool: true
                         ))
                     }
                 }
@@ -3067,6 +3089,9 @@ final class ChatViewModel {
         hasFinishedStreaming = false
         selfInitiatedStream = true
 
+        // Bump scroll token so ChatDetailView scrolls to the regenerating message
+        regenerateScrollToken = UUID()
+
         // Activate the isolated streaming store for the regenerated message
         streamingStore.beginStreaming(messageId: newAssistantId, modelId: modelId)
 
@@ -3181,6 +3206,12 @@ final class ChatViewModel {
                     if let err = json["error"] as? String, !err.isEmpty {
                         self.updateAssistantMessage(id: capturedNewAssistantId, content: "",
                                                      isStreaming: false, error: ChatMessageError(content: err))
+                        self.cleanupStreaming()
+                        return
+                    }
+                    if let detail = json["detail"] as? String, !detail.isEmpty, json["choices"] == nil {
+                        self.updateAssistantMessage(id: capturedNewAssistantId, content: "",
+                                                     isStreaming: false, error: ChatMessageError(content: detail))
                         self.cleanupStreaming()
                         return
                     }
@@ -3482,6 +3513,7 @@ final class ChatViewModel {
         isStreaming = true
         hasFinishedStreaming = false
         selfInitiatedStream = true
+        regenerateScrollToken = UUID()
 
         streamingStore.beginStreaming(messageId: assistantMessageId, modelId: modelId)
 
@@ -3580,6 +3612,12 @@ final class ChatViewModel {
                     if let err = json["error"] as? String, !err.isEmpty {
                         self.updateAssistantMessage(id: assistantMessageId, content: "", isStreaming: false,
                             error: ChatMessageError(content: err))
+                        self.cleanupStreaming()
+                        return
+                    }
+                    if let detail = json["detail"] as? String, !detail.isEmpty, json["choices"] == nil {
+                        self.updateAssistantMessage(id: assistantMessageId, content: "", isStreaming: false,
+                            error: ChatMessageError(content: detail))
                         self.cleanupStreaming()
                         return
                     }
@@ -4562,6 +4600,14 @@ final class ChatViewModel {
     ///
     /// Fetches the functions list from `/api/v1/functions/` to get global/active status.
     /// This ensures filterIds sent in chat requests always reflect the current server state.
+    ///
+    /// Also injects a `filters` array into `rawModelItem` containing full filter objects
+    /// (id, name, description, icon, has_user_valves). This matches the web client's
+    /// `model_item.filters` shape and is required so filter functions (e.g. Thinking presets)
+    /// can read their configuration correctly. Without this, filters that modify
+    /// `chat_template_kwargs` (Qwen3 thinking mode) fail on backends like Bedrock that
+    /// reject unknown parameters — because the filter can't detect its target model type
+    /// and falls back to injecting incompatible kwargs.
     private func resolveFiltersForModel(_ model: inout AIModel) async {
         guard let apiClient = manager?.apiClient else { return }
         do {
@@ -4569,6 +4615,7 @@ final class ChatViewModel {
             let filterFunctions = functions.filter { $0.type == "filter" && $0.isActive }
 
             var resolvedFilterIds: [String] = []
+            var resolvedFilterObjects: [[String: Any]] = []
             var seenIds = Set<String>()
 
             for fn in filterFunctions {
@@ -4578,11 +4625,42 @@ final class ChatViewModel {
                 if isGlobal || isPerModel {
                     guard !seenIds.contains(fn.id) else { continue }
                     seenIds.insert(fn.id)
-                    resolvedFilterIds.append(fn.id)
+
+                    // Only add to filterIds (top-level activation list) when this is a
+                    // toggle-filter AND the user has the pill turned ON.
+                    // Non-toggle global filters run server-side automatically via is_global
+                    // and must NOT be in filter_ids — sending them causes the backend to
+                    // forward chat_template_kwargs to models like Bedrock that reject it.
+                    // This matches exactly what WebUI does: filter_ids is only populated
+                    // for toggle-filters whose pill is enabled.
+                    let isToggleOn = fn.hasToggle && selectedToolIds.contains(fn.id)
+                    if isToggleOn {
+                        resolvedFilterIds.append(fn.id)
+                    }
+
+                    // Always build the full filter object for model_item.filters[] so the
+                    // server receives the complete filter list (same as WebUI) regardless of
+                    // pill state — filters read model_item to detect model type.
+                    var filterObj: [String: Any] = [
+                        "id": fn.id,
+                        "name": fn.name,
+                        "description": fn.description,
+                        "has_user_valves": false  // default; server-side checks its own DB
+                    ]
+                    if let icon = fn.iconURL, !icon.isEmpty {
+                        filterObj["icon"] = icon
+                    }
+                    resolvedFilterObjects.append(filterObj)
                 }
             }
 
             model.filterIds = resolvedFilterIds
+
+            // Inject the resolved filter objects into rawModelItem["filters"] so the
+            // server receives model_item.filters[] just like the web client sends.
+            if model.rawModelItem != nil {
+                model.rawModelItem?["filters"] = resolvedFilterObjects
+            }
         } catch {
             // Non-critical — keep whatever filterIds the model already has
             logger.debug("Failed to resolve filters: \(error.localizedDescription)")

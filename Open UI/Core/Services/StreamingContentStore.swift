@@ -48,6 +48,16 @@ final class StreamingContentStore {
     ///   `StreamingMarkdownView` instead of the full (potentially multi-KB) string.
     private(set) var frozenToolBoundaryOffset: Int = 0
 
+    /// Character offset into `displayContent` immediately after the last closed
+    /// `<details type="reasoning">` block. Mirrors `frozenToolBoundaryOffset` but
+    /// for thinking/reasoning content.
+    ///
+    /// - `0` means no reasoning block has been fully closed yet.
+    /// - `> 0` means everything before this offset is frozen reasoning HTML that
+    ///   will never change again. Combined with `frozenToolBoundaryOffset` via
+    ///   `max()` to determine the effective frozen boundary for `liveTextTail`.
+    private(set) var frozenReasoningBoundaryOffset: Int = 0
+
     /// Character offset of the last paragraph boundary (`\n\n`) that is safe to
     /// freeze during pure-prose streaming (no tool calls, no VIZ markers).
     ///
@@ -64,15 +74,17 @@ final class StreamingContentStore {
     /// `frozenProseBoundaryOffset` is updated. Prevents per-paragraph layout snaps.
     private static let proseBoundaryHysteresis: Int = 400
 
-    /// The substring of `displayContent` that starts after `frozenToolBoundaryOffset`.
-    /// This is the only part of the message still changing on every display-link tick
-    /// during post-tool prose streaming, so views should pass this (tiny) string to
-    /// `StreamingMarkdownView` rather than the full `displayContent`.
+    /// The substring of `displayContent` that starts after the effective frozen
+    /// boundary (`max(frozenToolBoundaryOffset, frozenReasoningBoundaryOffset)`).
+    /// This is the only part of the message still changing on every display-link tick,
+    /// so views should pass this (tiny) string to `StreamingMarkdownView` rather than
+    /// the full (potentially multi-KB) string.
     var liveTextTail: String {
-        guard frozenToolBoundaryOffset > 0 else { return displayContent }
+        let boundary = max(frozenToolBoundaryOffset, frozenReasoningBoundaryOffset)
+        guard boundary > 0 else { return displayContent }
         let dc = displayContent
-        guard dc.count > frozenToolBoundaryOffset else { return "" }
-        let idx = dc.index(dc.startIndex, offsetBy: frozenToolBoundaryOffset)
+        guard dc.count > boundary else { return "" }
+        let idx = dc.index(dc.startIndex, offsetBy: boundary)
         return String(dc[idx...])
     }
 
@@ -113,10 +125,10 @@ final class StreamingContentStore {
     private var isFinishing: Bool = false
 
     /// Hard cap on chars revealed per frame, regardless of server speed.
-    /// At 60fps: 6.0 chars/frame = 360 chars/sec — comfortable typewriter pace.
+    /// At 60fps: 7.0 chars/frame = 360 chars/sec — comfortable typewriter pace.
     /// Prevents fast models from dumping large bursts instantly, which destroys
     /// the character-by-character feel. The buffer simply grows and drains steadily.
-    private let maxCharsPerFrame: Double = 6.0
+    private let maxCharsPerFrame: Double = 7.0
 
     /// True from the frame that VIZ fast-forward is first completed (displayContent
     /// advanced to vizEndOffset) until the next drainTick where we start fresh.
@@ -149,6 +161,7 @@ final class StreamingContentStore {
         streamingContent = ""
         displayContent = ""
         frozenToolBoundaryOffset = 0
+        frozenReasoningBoundaryOffset = 0
         frozenProseBoundaryOffset = 0
         streamingStatusHistory = []
         streamingSources = []
@@ -263,6 +276,7 @@ final class StreamingContentStore {
         streamingContent = ""
         displayContent = ""
         frozenToolBoundaryOffset = 0
+        frozenReasoningBoundaryOffset = 0
         frozenProseBoundaryOffset = 0
         streamingStatusHistory = []
         streamingSources = []
@@ -415,7 +429,7 @@ final class StreamingContentStore {
         // Strategy: if the number of tool_calls <details opens exceeds the number
         // of </details> closes (adjusted for reasoning blocks), there is at least
         // one unclosed tool_calls block — suppress displayContent updates.
-        if Self.hasUnclosedToolCallBlock(full) {
+        if hasUnclosedToolCallBlock(full) {
             // While an unclosed <details type="tool_calls"> block is streaming,
             // do NOT update displayContent at all. The ToolCallView renders tool
             // metadata independently; no visible UI depends on the incomplete
@@ -424,6 +438,38 @@ final class StreamingContentStore {
             // Inline Visualizer and other tool responses.
             if isFinishing { completeCleanup() }
             return
+        }
+
+        // Closed reasoning <details> fast-forward:
+        // Reasoning content (thinking blocks) is intentionally drained character-by-
+        // character while active (to show live thinking text). But once the reasoning
+        // block is fully closed, any remaining undisplayed reasoning HTML is skipped
+        // instantly — it can be 10–100 KB for long thinkers and nobody reads the raw
+        // HTML token-by-token. This mirrors the tool_calls fast-forward exactly.
+        if hasClosedReasoningBlock(full) {
+            if let lastReasoningEnd = Self.lastReasoningDetailsEnd(in: full) {
+                if displayedCount < lastReasoningEnd {
+                    let endIdx = full.index(full.startIndex, offsetBy: lastReasoningEnd)
+                    let newDisplay = String(full[..<endIdx])
+                    if displayContent != newDisplay {
+                        displayContent = newDisplay
+                    }
+                    displayedCount = lastReasoningEnd
+                    buffered = totalCount - displayedCount
+                    if frozenReasoningBoundaryOffset != lastReasoningEnd {
+                        frozenReasoningBoundaryOffset = lastReasoningEnd
+                    }
+                    drainLog.debug("⏩ [REASONING] Skipped to lastReasoningEnd=\(lastReasoningEnd) postBuffered=\(buffered) isFinishing=\(self.isFinishing)")
+                    // Reset EMA drain state so post-reasoning prose starts fresh.
+                    lastKnownTotal = totalCount
+                    burstIntervalEMA = 8
+                    framesSinceLastBurst = 0
+                    isFirstBurst = true
+                    drainAccumulator = 0
+                    steadyRate = 0
+                    return
+                }
+            }
         }
 
         // Closed tool_calls <details> fast-forward:
@@ -435,7 +481,7 @@ final class StreamingContentStore {
         // Reasoning blocks are NOT skipped here — their content has already been
         // streamed character-by-character via the normal typewriter drain above.
         // Only skip up to the end of the last tool_calls </details> close.
-        if Self.hasClosedToolCallBlock(full) {
+        if hasClosedToolCallBlock(full) {
             if let lastToolCallCloseEnd = Self.lastToolCallDetailsEnd(in: full) {
                 if displayedCount < lastToolCallCloseEnd {
                     // Jump displayContent to the end of the last tool_calls </details> instantly.
@@ -577,35 +623,40 @@ final class StreamingContentStore {
 
         // Prose paragraph-boundary freeze (hysteresis update):
         // Only update frozenProseBoundaryOffset when there are no VIZ markers.
-        // Works for two cases:
-        //   • Pure prose (frozenToolBoundaryOffset == 0): search the full displayContent.
-        //   • Post-tool prose (frozenToolBoundaryOffset > 0): search only the live tail
-        //     (text after the frozen tool boundary) so we don't re-detect the tool-call
-        //     HTML block's paragraphs. The resulting candidate is converted to an absolute
-        //     offset before being stored.
-        // In both cases only advance when the new candidate is ≥ proseBoundaryHysteresis
-        // chars ahead of the current value to prevent per-paragraph layout snaps.
+        // Works for four cases (in priority order):
+        //   1. Post-tool prose (frozenToolBoundaryOffset > 0): search only the live tail
+        //      after the frozen tool boundary. Convert relative→absolute.
+        //   2. Post-reasoning prose (frozenReasoningBoundaryOffset > 0, no tool boundary):
+        //      search only after the frozen reasoning boundary. Convert relative→absolute.
+        //   3. Active reasoning streaming (no frozen boundaries, has "<details"):
+        //      search the full displayContent — reasoning text IS prose and benefits
+        //      from paragraph freezing even while inside a <details block.
+        //      Previously this case was excluded entirely, causing O(N) re-renders.
+        //   4. Pure prose (no boundaries, no <details): search full displayContent.
+        // In all cases only advance when candidate is ≥ proseBoundaryHysteresis ahead.
         let newDC = displayContent
         if !newDC.contains("@@@VIZ-START") {
-            if frozenToolBoundaryOffset == 0 && !newDC.contains("<details") {
-                // Pure-prose path: search full displayContent.
-                let candidate = Self.lastParagraphBoundary(in: newDC)
-                if candidate > frozenProseBoundaryOffset + Self.proseBoundaryHysteresis {
-                    frozenProseBoundaryOffset = candidate
-                }
-            } else if frozenToolBoundaryOffset > 0 {
-                // Post-tool-prose path: search only the live tail so we don't re-freeze
-                // inside the already-frozen tool-call HTML. Convert relative→absolute.
-                let tailStartOffset = frozenToolBoundaryOffset
-                guard newDC.count > tailStartOffset else { return }
-                let tailStartIdx = newDC.index(newDC.startIndex, offsetBy: tailStartOffset)
+            let effectiveFrozenBoundary = max(frozenToolBoundaryOffset, frozenReasoningBoundaryOffset)
+            if effectiveFrozenBoundary > 0 {
+                // Post-tool or post-reasoning path: search only the live tail.
+                guard newDC.count > effectiveFrozenBoundary else { return }
+                let tailStartIdx = newDC.index(newDC.startIndex, offsetBy: effectiveFrozenBoundary)
                 let liveTailStr = String(newDC[tailStartIdx...])
                 let relCandidate = Self.lastParagraphBoundary(in: liveTailStr)
                 if relCandidate > 0 {
-                    let absCandidate = tailStartOffset + relCandidate
+                    let absCandidate = effectiveFrozenBoundary + relCandidate
                     if absCandidate > frozenProseBoundaryOffset + Self.proseBoundaryHysteresis {
                         frozenProseBoundaryOffset = absCandidate
                     }
+                }
+            } else {
+                // Pure-prose path OR active-reasoning path: search full displayContent.
+                // Reasoning content is ordinary markdown text inside a <details wrapper;
+                // paragraph freezing reduces per-frame parse cost from O(totalChars) to
+                // O(currentParagraph) — critical for long thinkers (50,000+ char responses).
+                let candidate = Self.lastParagraphBoundary(in: newDC)
+                if candidate > frozenProseBoundaryOffset + Self.proseBoundaryHysteresis {
+                    frozenProseBoundaryOffset = candidate
                 }
             }
         } else if newDC.contains("\n@@@VIZ-END") {
@@ -631,62 +682,94 @@ final class StreamingContentStore {
 
     // MARK: - Details Block Detection
 
-    /// Returns `true` if `content` contains at least one unclosed
-    /// `<details type="tool_calls">` block (open count > close count,
-    /// adjusted for reasoning blocks which are handled separately).
-    ///
-    /// Reasoning blocks (`<details type="reasoning">`) are intentionally
-    /// excluded so their content streams via the normal typewriter drain.
-    ///
-    /// Uses simple substring counting (not regex) — O(n) and cheap enough
-    /// to run on every display-link tick (up to 60fps).
-    private static func hasUnclosedToolCallBlock(_ content: String) -> Bool {
-        guard content.contains("tool_calls") else { return false }
+    /// Result of a single-pass tool-call block analysis.
+    private struct ToolCallBlockFlags {
+        let hasUnclosed: Bool
+        let hasClosed: Bool
+    }
 
-        // Count tool_calls opening tags
+    // Bug 2: Cache the tool-call block flags so the 6-independent-scan pipeline
+    // runs at most once per unique content length (content is append-only).
+    // The common case (same length as last tick) returns the cached result in O(1).
+    private var _toolCallFlagsCache: (contentCount: Int, flags: ToolCallBlockFlags)?
+
+    /// Analyses `content` for open/closed tool_call detail blocks in a **single linear pass**.
+    ///
+    /// Previously this was 6 independent `range(of:)` full-string loops called up to
+    /// twice per drain tick (hasUnclosed + hasClosedToolCallBlock calling hasUnclosed).
+    /// Now both flags are produced by one walk through the string, and the result is
+    /// cached by `streamingContent.count` — content is append-only, so a stable count
+    /// guarantees the same result.
+    private func toolCallFlags(for content: String) -> ToolCallBlockFlags {
+        let count = content.count
+        if let cached = _toolCallFlagsCache, cached.contentCount == count {
+            return cached.flags
+        }
+
+        guard content.contains("tool_calls") else {
+            let flags = ToolCallBlockFlags(hasUnclosed: false, hasClosed: false)
+            _toolCallFlagsCache = (count, flags)
+            return flags
+        }
+
         var toolCallOpenCount = 0
-        var searchRange = content.startIndex..<content.endIndex
-        let toolCallOpenTag = "tool_calls"
-        while let range = content.range(of: toolCallOpenTag, options: .caseInsensitive, range: searchRange) {
-            toolCallOpenCount += 1
-            searchRange = range.upperBound..<content.endIndex
-        }
-
-        // Count ALL closing </details> tags
         var totalCloseCount = 0
-        searchRange = content.startIndex..<content.endIndex
-        let closeTag = "</details>"
-        while let range = content.range(of: closeTag, options: .caseInsensitive, range: searchRange) {
-            totalCloseCount += 1
-            searchRange = range.upperBound..<content.endIndex
-        }
-
-        // Count reasoning opening tags (these have their own </details> closes)
         var reasoningOpenCount = 0
-        searchRange = content.startIndex..<content.endIndex
-        let reasoningTag = "type=\"reasoning\""
-        while let range = content.range(of: reasoningTag, options: .caseInsensitive, range: searchRange) {
-            reasoningOpenCount += 1
-            searchRange = range.upperBound..<content.endIndex
-        }
-        // Also check single-quote variant
-        searchRange = content.startIndex..<content.endIndex
-        let reasoningTagSingle = "type='reasoning'"
-        while let range = content.range(of: reasoningTagSingle, options: .caseInsensitive, range: searchRange) {
-            reasoningOpenCount += 1
-            searchRange = range.upperBound..<content.endIndex
+
+        // Single walk: count all three markers simultaneously.
+        var idx = content.startIndex
+        while idx < content.endIndex {
+            // Check for <details (opening tag prefix)
+            if content[idx] == "<" {
+                // Try to match "<details" efficiently without allocating substrings
+                let detailsTag = "<details"
+                if content[idx...].hasPrefix(detailsTag) {
+                    // Advance past "<details" and look for type attribute
+                    let afterDetails = content.index(idx, offsetBy: detailsTag.count, limitedBy: content.endIndex) ?? content.endIndex
+                    // Scan to end of this tag (up to ">")
+                    var tagEnd = afterDetails
+                    while tagEnd < content.endIndex && content[tagEnd] != ">" {
+                        tagEnd = content.index(after: tagEnd)
+                    }
+                    let tagContent = String(content[idx..<tagEnd])
+                    let lower = tagContent.lowercased()
+                    if lower.contains("tool_calls") {
+                        toolCallOpenCount += 1
+                    } else if lower.contains("type=\"reasoning\"") || lower.contains("type='reasoning'") {
+                        reasoningOpenCount += 1
+                    }
+                    idx = tagEnd < content.endIndex ? content.index(after: tagEnd) : content.endIndex
+                    continue
+                }
+                // Try to match "</details>" (closing tag)
+                let closeTag = "</details>"
+                if content[idx...].hasPrefix(closeTag) {
+                    totalCloseCount += 1
+                    idx = content.index(idx, offsetBy: closeTag.count, limitedBy: content.endIndex) ?? content.endIndex
+                    continue
+                }
+            }
+            idx = content.index(after: idx)
         }
 
-        // Closes available for tool_calls blocks = total closes minus reasoning closes
         let toolCallCloseCount = max(0, totalCloseCount - reasoningOpenCount)
-        return toolCallOpenCount > toolCallCloseCount
+        let hasUnclosed = toolCallOpenCount > toolCallCloseCount
+        let hasClosed = toolCallOpenCount > 0 && !hasUnclosed
+        let flags = ToolCallBlockFlags(hasUnclosed: hasUnclosed, hasClosed: hasClosed)
+        _toolCallFlagsCache = (count, flags)
+        return flags
+    }
+
+    /// Returns `true` if `content` contains at least one unclosed
+    /// `<details type="tool_calls">` block.
+    private func hasUnclosedToolCallBlock(_ content: String) -> Bool {
+        return toolCallFlags(for: content).hasUnclosed
     }
 
     /// Returns `true` if `content` contains at least one fully closed
     /// `<details type="tool_calls">` block.
-    private static func hasClosedToolCallBlock(_ content: String) -> Bool {
-        guard content.contains("tool_calls") && content.contains("</details>") else { return false }
-        return !hasUnclosedToolCallBlock(content)
+    private func hasClosedToolCallBlock(_ content: String) -> Bool {
+        return toolCallFlags(for: content).hasClosed
     }
 
     /// Finds the character offset immediately after the last closing `</details>`
@@ -738,6 +821,107 @@ final class StreamingContentStore {
         }
 
         guard let endIdx = lastToolCallEnd else { return nil }
+        return content.distance(from: content.startIndex, to: endIdx)
+    }
+
+    // MARK: - Reasoning Block Detection
+
+    /// Count-based cache for reasoning block flags (mirrors `_toolCallFlagsCache`).
+    private var _reasoningFlagsCache: (contentCount: Int, hasClosed: Bool)?
+
+    /// Returns `true` if `content` contains at least one fully closed
+    /// `<details type="reasoning">` block.
+    ///
+    /// Uses a count-based cache — content is append-only, so a stable count
+    /// guarantees the same result without rescanning.
+    private func hasClosedReasoningBlock(_ content: String) -> Bool {
+        let count = content.count
+        if let cached = _reasoningFlagsCache, cached.contentCount == count {
+            return cached.hasClosed
+        }
+        // Quick pre-check: must contain both a reasoning open and any close tag.
+        guard content.contains("reasoning"), content.contains("</details>") else {
+            _reasoningFlagsCache = (count, false)
+            return false
+        }
+
+        // Single-pass walk: count reasoning opens and total closes.
+        var reasoningOpenCount = 0
+        var totalCloseCount = 0
+        var toolCallOpenCount = 0
+        var idx = content.startIndex
+        while idx < content.endIndex {
+            if content[idx] == "<" {
+                let detailsTag = "<details"
+                if content[idx...].hasPrefix(detailsTag) {
+                    let afterDetails = content.index(idx, offsetBy: detailsTag.count, limitedBy: content.endIndex) ?? content.endIndex
+                    var tagEnd = afterDetails
+                    while tagEnd < content.endIndex && content[tagEnd] != ">" {
+                        tagEnd = content.index(after: tagEnd)
+                    }
+                    let tagContent = String(content[idx..<tagEnd]).lowercased()
+                    if tagContent.contains("reasoning") {
+                        reasoningOpenCount += 1
+                    } else if tagContent.contains("tool_calls") {
+                        toolCallOpenCount += 1
+                    }
+                    idx = tagEnd < content.endIndex ? content.index(after: tagEnd) : content.endIndex
+                    continue
+                }
+                let closeTag = "</details>"
+                if content[idx...].hasPrefix(closeTag) {
+                    totalCloseCount += 1
+                    idx = content.index(idx, offsetBy: closeTag.count, limitedBy: content.endIndex) ?? content.endIndex
+                    continue
+                }
+            }
+            idx = content.index(after: idx)
+        }
+
+        // Each reasoning open consumes one close; remaining closes go to tool_calls.
+        // A reasoning block is "closed" if its close was consumed (opens ≤ totalCloses).
+        let hasClosed = reasoningOpenCount > 0 && totalCloseCount >= reasoningOpenCount
+        _reasoningFlagsCache = (count, hasClosed)
+        return hasClosed
+    }
+
+    /// Finds the character offset immediately after the last closing `</details>`
+    /// tag that belongs to a `<details type="reasoning">` block.
+    /// Returns `nil` if no closed reasoning block is found.
+    private static func lastReasoningDetailsEnd(in content: String) -> Int? {
+        let closeTag = "</details>"
+        guard content.contains("reasoning"), content.contains(closeTag) else { return nil }
+
+        var closeEnds: [String.Index] = []
+        var searchRange = content.startIndex..<content.endIndex
+        while let range = content.range(of: closeTag, options: .caseInsensitive, range: searchRange) {
+            closeEnds.append(range.upperBound)
+            searchRange = range.upperBound..<content.endIndex
+        }
+
+        var openStarts: [String.Index] = []
+        searchRange = content.startIndex..<content.endIndex
+        let openTag = "<details"
+        while let range = content.range(of: openTag, options: .caseInsensitive, range: searchRange) {
+            openStarts.append(range.lowerBound)
+            searchRange = range.upperBound..<content.endIndex
+        }
+
+        guard !closeEnds.isEmpty && !openStarts.isEmpty else { return nil }
+
+        var lastReasoningEnd: String.Index? = nil
+        let pairCount = min(closeEnds.count, openStarts.count)
+        for i in 0..<pairCount {
+            let openIdx = openStarts[i]
+            if let tagEnd = content.range(of: ">", range: openIdx..<content.endIndex) {
+                let tagText = String(content[openIdx..<tagEnd.upperBound]).lowercased()
+                if tagText.contains("reasoning") {
+                    lastReasoningEnd = closeEnds[i]
+                }
+            }
+        }
+
+        guard let endIdx = lastReasoningEnd else { return nil }
         return content.distance(from: content.startIndex, to: endIdx)
     }
 

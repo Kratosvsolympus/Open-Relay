@@ -170,8 +170,10 @@ final class VoiceCallViewModel {
             await ttsService.preloadKokoroModel()
         }
 
-        // Enable speaker override in TTS service for the duration of this call
-        ttsService.speakerOverrideEnabled = isSpeakerOn
+        // Keep .playAndRecord session alive for the full call duration so the mic
+        // stays active during TTS. Speaker vs earpiece routing is controlled
+        // separately via applySpeakerOverride() — don't tie it to speakerOverrideEnabled.
+        ttsService.speakerOverrideEnabled = true
 
         // Start call timer
         callStartTime = Date()
@@ -245,7 +247,8 @@ final class VoiceCallViewModel {
     /// Toggles audio output between loudspeaker and earpiece.
     func toggleSpeaker() {
         isSpeakerOn.toggle()
-        ttsService.speakerOverrideEnabled = isSpeakerOn
+        // speakerOverrideEnabled stays true for the whole call (keeps .playAndRecord active).
+        // Only the output port routing needs to change here.
         applySpeakerOverride()
     }
 

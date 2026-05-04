@@ -138,4 +138,18 @@ final class FunctionsManager {
     func updateValves(id: String, values: [String: Any]) async throws -> [String: Any] {
         return try await apiClient.updateFunctionValves(id: id, values: values)
     }
+
+    // MARK: - User Valves
+
+    func getUserValves(id: String) async throws -> [String: Any] {
+        return try await apiClient.getFunctionUserValves(id: id)
+    }
+
+    func getUserValvesSpecWithOrder(id: String) async throws -> ([String: Any], [String]) {
+        return try await apiClient.getFunctionUserValvesSpecOrdered(id: id)
+    }
+
+    func updateUserValves(id: String, values: [String: Any]) async throws -> [String: Any] {
+        return try await apiClient.updateFunctionUserValves(id: id, values: values)
+    }
 }
