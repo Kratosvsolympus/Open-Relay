@@ -195,6 +195,8 @@ struct ChatDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .task {
+            // Start keyboard tracking FIRST so the bottom inset is
+            // correct for the very first layout pass (D9 fix).
             keyboard.start()
             if let manager = dependencies.conversationManager {
                 viewModel.configure(with: manager, socket: dependencies.socketService, store: dependencies.activeChatStore, asr: dependencies.asrService)
@@ -204,30 +206,38 @@ struct ChatDetailView: View {
             if viewModel.isNewConversation {
                 viewModel.isTemporaryChat = UserDefaults.standard.bool(forKey: "temporaryChatDefault")
             }
-            randomPrompts = Self.resolvePromptSuggestions(
-                adminSuggestions: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
-                modelSuggestions: viewModel.selectedModel?.suggestionPrompts,
-                count: promptCardCount
-            )
+            // Only resolve prompts pre-load for new chats — existing chats
+            // already have a model; we'll resolve after load() below (D10 fix).
+            if viewModel.isNewConversation {
+                randomPrompts = Self.resolvePromptSuggestions(
+                    adminSuggestions: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
+                    modelSuggestions: viewModel.selectedModel?.suggestionPrompts,
+                    count: promptCardCount
+                )
+            }
             NotificationService.shared.activeConversationId =
                 viewModel.conversationId ?? viewModel.conversation?.id
-        await viewModel.load()
-        // After messages load, ensure we're pinned to the latest window and
-        // scroll to the bottom. The 60ms delay lets the ScrollView finish
-        // laying out the newly-populated content before we issue the scroll.
-        let loadedCount = viewModel.messages.count
-        if loadedCount > 0 {
-            isScrolledUp = false
-            windowEnd = nil
-            windowSize = min(maxWindowSize, loadedCount)
-            try? await Task.sleep(nanoseconds: 60_000_000) // 60ms layout settle
-            scrollPosition.scrollTo(edge: .bottom)
-        }
-        await viewModel.fetchPinnedModels()
-        // Rebuild prompts after load() — models are now fetched with fresh
-            // suggestion_prompts from the server. The pre-load resolve above
-            // uses cached data for instant display; this post-load resolve
-            // ensures prompts reflect the latest server state.
+            await viewModel.load()
+            // After messages load, pin the window to the latest messages.
+            // Do NOT issue a programmatic scrollTo here — defaultScrollAnchor(.bottom)
+            // already places the view at the bottom on first layout, and a redundant
+            // scrollTo after a sleep fights WKWebView / code-block height settling
+            // and produces the visible "bounce" the user reported (A1 fix).
+            let loadedCount = viewModel.messages.count
+            if loadedCount > 0 {
+                isScrolledUp = false
+                windowEnd = nil
+                windowSize = min(maxWindowSize, loadedCount)
+                // Suppress the content-height-driven streaming scroll for
+                // the next 400 ms while WKWebViews, MarkdownView, and other
+                // expensive blocks finish their first layout pass. Without
+                // this guard the scroll pump fires on each height growth event
+                // and produces multiple position jumps (A3 fix).
+                _scrollRefs.lastProgrammaticScrollTime = Date()
+            }
+            await viewModel.fetchPinnedModels()
+            // Rebuild prompts after load() — models are now fetched with fresh
+            // suggestion_prompts from the server.
             randomPrompts = Self.resolvePromptSuggestions(
                 adminSuggestions: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
                 modelSuggestions: viewModel.selectedModel?.suggestionPrompts,
@@ -1077,11 +1087,18 @@ struct ChatDetailView: View {
         ScrollView {
             VStack(spacing: 0) {
                 if viewModel.isLoadingConversation {
+                    // A2: crossfade instead of hard-swap so the transition
+                    // between skeleton placeholders and real message content
+                    // is smooth and hides the single layout frame where
+                    // WKWebViews / MarkdownView first measure themselves.
                     loadingPlaceholders
+                        .transition(.opacity)
                 } else {
                     messagesList
+                        .transition(.opacity)
                 }
             }
+            .animation(.easeInOut(duration: 0.18), value: viewModel.isLoadingConversation)
             .padding(.top, 8)
             .padding(.bottom, 8)
             .frame(maxWidth: iPadMaxContentWidth)
@@ -1296,11 +1313,17 @@ struct ChatDetailView: View {
         // Bug 10: indexMap was rebuilt (O(n) allocation) on every messagesList evaluation.
         // Cache it as a @State dictionary, only rebuilt when the message count changes
         // (messages are append-only so indices are stable until a deletion).
-        if cachedIndexMap.isEmpty || cachedIndexMap.count != total {
-            cachedIndexMap = Dictionary(allMessages.enumerated().map { ($1.id, $0) },
-                                        uniquingKeysWith: { first, _ in first })
+        // Avoid mutating @State directly during view update — compute locally and
+        // schedule the cache update for after the current render pass.
+        let indexMap: [String: Int]
+        if cachedIndexMap.count == total && !cachedIndexMap.isEmpty {
+            indexMap = cachedIndexMap
+        } else {
+            let freshMap = Dictionary(allMessages.enumerated().map { ($1.id, $0) },
+                                      uniquingKeysWith: { first, _ in first })
+            indexMap = freshMap
+            Task { @MainActor in cachedIndexMap = freshMap }
         }
-        let indexMap = cachedIndexMap
 
         // Split point: index of the last user message *within the visible slice*.
         // Everything from here to the end is the "last turn".
@@ -2433,14 +2456,7 @@ struct ChatDetailView: View {
             HStack(spacing: Spacing.xs) {
                 HStack(spacing: -4) {
                     ForEach(Array(sources.prefix(3).enumerated()), id: \.offset) { _, source in
-                        Circle()
-                            .fill(theme.brandPrimary.opacity(0.2))
-                            .frame(width: 18, height: 18)
-                            .overlay(
-                                Text(String((source.title ?? source.url ?? "?").prefix(1)).uppercased())
-                                    .scaledFont(size: 8, weight: .bold)
-                                    .foregroundStyle(theme.brandPrimary)
-                            )
+                        sourceIconBadge(source: source)
                     }
                 }
                 Text("\(sources.count) Source\(sources.count == 1 ? "" : "s")")
@@ -2453,6 +2469,46 @@ struct ChatDetailView: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+
+    /// A 18×18 circular icon for a source: favicon via Google S2 if a URL is available,
+    /// or a letter avatar as fallback for knowledge/file sources with no domain.
+    @ViewBuilder
+    private func sourceIconBadge(source: ChatSourceReference) -> some View {
+        let domain: String? = {
+            guard let url = source.resolvedURL,
+                  let parsed = URL(string: url),
+                  let host = parsed.host, !host.isEmpty else { return nil }
+            return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        }()
+
+        if let domain {
+            AsyncImage(url: URL(string: "https://www.google.com/s2/favicons?sz=32&domain=\(domain)")) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 18, height: 18)
+                        .clipShape(Circle())
+                default:
+                    letterAvatarBadge(source: source)
+                }
+            }
+        } else {
+            letterAvatarBadge(source: source)
+        }
+    }
+
+    private func letterAvatarBadge(source: ChatSourceReference) -> some View {
+        Circle()
+            .fill(theme.brandPrimary.opacity(0.2))
+            .frame(width: 18, height: 18)
+            .overlay(
+                Text(String((source.title ?? source.url ?? "?").prefix(1)).uppercased())
+                    .scaledFont(size: 8, weight: .bold)
+                    .foregroundStyle(theme.brandPrimary)
+            )
     }
 
     // MARK: - Follow-Up Suggestions
@@ -3417,8 +3473,6 @@ private struct IsolatedAssistantMessage: View {
     let message: ChatMessage
     let activeVersionIndex: Int
     /// When set, overrides all other content resolution (used when showing an older user message edit version).
-    /// This allows the UI to show the paired AI response for an older user edit WITHOUT creating fake
-    /// regeneration versions on the assistant message.
     var contentOverride: String? = nil
     let serverBaseURL: String
     /// Auth token passed down to Rich UI embed webviews for localStorage injection.
@@ -3426,34 +3480,36 @@ private struct IsolatedAssistantMessage: View {
     /// APIClient for rendering inline images via AuthenticatedImageView.
     var apiClient: APIClient? = nil
 
+    /// Observed so that toggling "Show citation domains" in Settings immediately re-renders citation badges.
+
     var body: some View {
         let isActivelyStreaming = streamingStore.streamingMessageId == message.id
             && streamingStore.isActive
 
         let vIdx = activeVersionIndex
         let rawContent: String = {
-            // During streaming, use displayContent (the smoothly-drained version)
-            // rather than streamingContent (raw server tokens). This gives the
-            // typewriter effect — characters flow in at a smooth, readable rate
-            // instead of bursting in large chunks.
             if isActivelyStreaming { return streamingStore.displayContent }
-            // If there's a content override (older user edit version), use it
             if let override = contentOverride { return override }
             if vIdx >= 0 && vIdx < message.versions.count { return message.versions[vIdx].content }
             return message.content
         }()
 
-        let effectiveSources: [ChatSourceReference] = isActivelyStreaming
-            ? streamingStore.streamingSources : message.sources
+        // Use streaming sources if actively streaming.
+        // After streaming finishes, message.sources may not have propagated yet —
+        // fall back to the store's sources (they persist until beginStreaming() is
+        // called for the next message) so citations render immediately on completion.
+        let effectiveSources: [ChatSourceReference] = {
+            if isActivelyStreaming { return streamingStore.streamingSources }
+            if !message.sources.isEmpty { return message.sources }
+            // Brief post-stream window: message not yet committed — use last streaming sources
+            return streamingStore.streamingSources
+        }()
 
-        // During streaming: pass raw content through (zero processing per token).
-        // After streaming: apply URL resolution and citation linking.
-        // Note: soft breaks are now handled natively by MarkdownView (renders
-        // \n as line breaks instead of spaces), so no convertSoftBreaksToHard needed.
+        let preferDomain = UserDefaults.standard.object(forKey: "citationShowDomain") as? Bool ?? true
+
         let displayContent: String = {
             if isActivelyStreaming { return rawContent }
             let resolved = Self.resolveRelativeURLs(rawContent, baseURL: serverBaseURL)
-            let preferDomain = UserDefaults.standard.object(forKey: "citationShowDomain") as? Bool ?? true
             return Self.preprocessCitations(resolved, sources: effectiveSources, preferDomain: preferDomain)
         }()
 
@@ -3461,121 +3517,111 @@ private struct IsolatedAssistantMessage: View {
 
         if effectiveIsStreaming && rawContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             TypingIndicator()
-        } else {
-            // Perf optimisation: when a tool-call block has been fully closed and
-            // the frozen boundary is known, split the content so the heavy tool-call
-            // HTML is never re-parsed after it finishes streaming.
+        } else if isActivelyStreaming && streamingStore.frozenBoundary > 0 {
+
+
+            // ── Split-render path: frozen tool/reasoning + live tail ──────────
             //
-            // frozenContent — everything up to & including the last </details> close —
-            // has a stable hashValue between display-link ticks. AssistantMessageContent's
+            // The background actor pre-slices all strings before publishing.
+            // We read them directly — no @State cache, no String allocation on main.
+            // frozenContent is stable between boundary advances → AssistantMessageContent's
             // ParseCache hits on every frame (zero re-parse cost).
-            //
-            // liveTextTail — the small prose that the user is currently reading —
-            // is passed to a lightweight standalone StreamingMarkdownView so only
-            // the handful of characters that changed this tick are re-rendered.
-            // Combined frozen boundary: max of tool_calls and reasoning close offsets.
-            // Reasoning blocks (thinking) now get their own frozen boundary so the
-            // potentially 50,000+ char reasoning HTML is never re-parsed once closed.
-            let frozenBoundary = isActivelyStreaming
-                ? max(streamingStore.frozenToolBoundaryOffset, streamingStore.frozenReasoningBoundaryOffset)
-                : 0
-            // Only block the split-render path for content that AssistantMessageContent
-            // must handle: VIZ markers and *unclosed* <details blocks.
-            // Closed reasoning blocks (frozenReasoningBoundaryOffset > 0) are already
-            // frozen and appear only in the non-changing `frozenContent` half — they
-            // do NOT require full routing and must NOT block the efficient split path.
-            let liveTail = isActivelyStreaming ? streamingStore.liveTextTail : ""
-            let liveTailHasSpecialContent = liveTail.contains("@@@VIZ-START")
-                || (liveTail.contains("<details") && !liveTail.contains("</details>"))
-            if frozenBoundary > 0 && !liveTailHasSpecialContent {
-                let dc = streamingStore.displayContent
-                let frozenContent: String = {
-                    guard dc.count >= frozenBoundary else { return dc }
-                    return String(dc[..<dc.index(dc.startIndex, offsetBy: frozenBoundary)])
-                }()
+            let liveTailStr = streamingStore.liveTail
+            // An unclosed <details> block must disable streaming so the raw HTML
+            // tag text doesn't flash before the block completes.
+            let liveTailHasUnclosedDetails = liveTailStr.contains("<details") && !liveTailStr.contains("</details>")
+            // A VIZ block (including an unclosed one) must still stream so that
+            // InlineVisualizerView receives `isStreaming: true` and uses its
+            // reconcileContent path instead of finalizeContent (which fails
+            // silently on partial HTML). Without this, the whole visualization
+            // box — and any text after @@@VIZ-END — fails to appear during
+            // streaming and only renders after the chat is reopened.
+            // liveTail only contains post-<details> prose text, so a simple contains
+            // is sufficient — no fake markers can exist here.
+            let liveTailHasViz = liveTailStr.contains("@@@VIZ-START")
+            // Prose split is only safe when the live tail has no special block at all.
+            let liveTailHasSpecial = liveTailHasUnclosedDetails || liveTailHasViz
 
-                VStack(alignment: .leading, spacing: 0) {
-                    // Frozen tool-call / reasoning segments — hash is stable, cache always hits.
-                    AssistantMessageContent(
-                        content: frozenContent,
-                        isStreaming: false,
-                        messageEmbeds: message.embeds,
-                        authToken: authToken,
-                        serverBaseURL: serverBaseURL,
-                        apiClient: apiClient
-                    )
-                    // Live tail — split further at the prose freeze boundary if available,
-                    // so post-tool prose also benefits from paragraph-boundary freezing.
-                    if !liveTail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        let proseBoundaryAbs = streamingStore.frozenProseBoundaryOffset
-                        let relProseBoundary = proseBoundaryAbs > frozenBoundary
-                            ? proseBoundaryAbs - frozenBoundary : 0
-                        if relProseBoundary > 0 && liveTail.count >= relProseBoundary {
-                            let splitIdx = liveTail.index(liveTail.startIndex, offsetBy: relProseBoundary)
-                            let frozenTailProse = String(liveTail[..<splitIdx])
-                            let liveProsTail   = String(liveTail[splitIdx...])
-                            StreamingMarkdownView(content: frozenTailProse, isStreaming: false)
-                            if !liveProsTail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                StreamingMarkdownView(content: liveProsTail, isStreaming: true)
-                            }
-                        } else {
-                            StreamingMarkdownView(content: liveTail, isStreaming: true)
+            VStack(alignment: .leading, spacing: 0) {
+                AssistantMessageContent(
+                    content: streamingStore.frozenContent,
+                    isStreaming: false,
+                    messageEmbeds: message.embeds,
+                    authToken: authToken,
+                    serverBaseURL: serverBaseURL,
+                    apiClient: apiClient
+                )
+                if !liveTailStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if !liveTailHasSpecial && !streamingStore.liveTailFrozenProse.isEmpty {
+                        // Further split at prose boundary within the live tail
+                        StreamingMarkdownView(content: streamingStore.liveTailFrozenProse, isStreaming: false)
+                        if !streamingStore.liveTailLiveProse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            StreamingMarkdownView(content: streamingStore.liveTailLiveProse, isStreaming: true)
                         }
+                    } else {
+                        // VIZ content must stream; only unclosed <details> disables streaming.
+                        StreamingMarkdownView(content: liveTailStr, isStreaming: !liveTailHasUnclosedDetails)
                     }
-                }
-                .transaction { $0.animation = nil }
-            } else {
-                // Fix D: paragraph-boundary freezing for pure prose streaming.
-                //
-                // When no tool calls or VIZ markers are present AND the message is long
-                // enough (> 300 chars), split at the last completed paragraph boundary
-                // (\n\n in the safe zone ≥200 chars from the current end).
-                //
-                // frozenProse  — everything up to the last \n\n — is rendered with
-                //   isStreaming=false. Its content only changes when a new paragraph
-                //   completes (~every few seconds) rather than on every display-link tick.
-                //
-                // liveProse    — the current in-progress paragraph, typically 50–200
-                //   chars — is re-rendered every tick, but is tiny so MarkdownView's
-                //   CommonMark parse is negligible (~20-40× cheaper than parsing the
-                //   full multi-KB string at 60fps).
-                //
-                // Safety guards: skip if <details or @@@VIZ-START are present (those
-                // need AssistantMessageContent's full routing), and skip if we are not
-                // actively streaming (no benefit for already-completed messages).
-                let proseFreezeOffset = isActivelyStreaming
-                    ? streamingStore.frozenProseBoundaryOffset
-                    : 0
-
-                if proseFreezeOffset > 0 && displayContent.count >= proseFreezeOffset {
-                    let dc = displayContent
-                    let splitIdx = dc.index(dc.startIndex, offsetBy: proseFreezeOffset)
-                    let frozenProse = String(dc[..<splitIdx])
-                    let liveProse   = String(dc[splitIdx...])
-                    VStack(alignment: .leading, spacing: 0) {
-                        // Frozen paragraphs: hash changes only when boundary advances (~every 400 chars).
-                        StreamingMarkdownView(content: frozenProse, isStreaming: false)
-                        // Live tail: current paragraph only, changes every tick.
-                        if !liveProse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            StreamingMarkdownView(content: liveProse, isStreaming: true)
-                        }
-                    }
-                    .transaction { $0.animation = nil }
-                } else {
-                    AssistantMessageContent(
-                        content: displayContent,
-                        isStreaming: effectiveIsStreaming,
-                        messageEmbeds: message.embeds,
-                        authToken: authToken,
-                        serverBaseURL: serverBaseURL,
-                        apiClient: apiClient
-                    )
                 }
             }
+            .transaction { $0.animation = nil }
+        } else if isActivelyStreaming && !streamingStore.pureFrozenProse.isEmpty {
+            // ── Pure-prose split path ─────────────────────────────────────────
+            //
+            // No tool/reasoning blocks. Pipeline pre-slices at paragraph boundary.
+            // pureFrozenProse is stable until the boundary advances (~every 400 chars).
+            VStack(alignment: .leading, spacing: 0) {
+                StreamingMarkdownView(content: streamingStore.pureFrozenProse, isStreaming: false)
+                if !streamingStore.pureLiveProse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    StreamingMarkdownView(content: streamingStore.pureLiveProse, isStreaming: true)
+                }
+            }
+            .transaction { $0.animation = nil }
+        } else {
+            // ── Fallback: full AssistantMessageContent (non-streaming or short message) ─
+            AssistantMessageContent(
+                content: displayContent,
+                isStreaming: effectiveIsStreaming,
+                messageEmbeds: message.embeds,
+                authToken: authToken,
+                serverBaseURL: serverBaseURL,
+                apiClient: apiClient
+            )
         }
     }
 
     // MARK: - Static Preprocessing (no ChatDetailView dependency)
+
+    /// Strips all `<details type="tool_calls" ...>...</details>` blocks from `text`.
+    ///
+    /// The Open WebUI server embeds a 100KB+ HTML blob in the `embeds` attribute of
+    /// these blocks (the web UI's iframe-based visualization renderer). On iOS we don't
+    /// use those embeds — we render natively — so processing this giant string on every
+    /// streaming frame is pure waste and causes UI lag.
+    ///
+    /// Critically, the embeds blob contains a fake `@@@VIZ-START` marker that was
+    /// triggering false-positive VIZ detection and causing the wrong render branch to
+    /// be selected during streaming. Stripping the entire block eliminates both problems.
+    ///
+    /// This runs in a single O(n) scan and avoids any regex overhead.
+    static func stripToolCallDetails(_ text: String) -> String {
+        let openTag = "<details type=\"tool_calls\""
+        let closeTag = "</details>"
+        var result = text
+        var searchStart = result.startIndex
+        while searchStart < result.endIndex,
+              let open = result.range(of: openTag, range: searchStart..<result.endIndex) {
+            if let close = result.range(of: closeTag, range: open.lowerBound..<result.endIndex) {
+                result.removeSubrange(open.lowerBound..<close.upperBound)
+                searchStart = open.lowerBound
+            } else {
+                // Unclosed block — strip from the open tag to the end of string
+                result = String(result[..<open.lowerBound])
+                break
+            }
+        }
+        return result
+    }
 
     static func preprocessCitations(_ content: String, sources: [ChatSourceReference], preferDomain: Bool = true) -> String {
         guard !sources.isEmpty else { return content }

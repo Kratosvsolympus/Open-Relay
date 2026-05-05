@@ -288,11 +288,14 @@ struct ChatCompletionRequest: Sendable {
         var imageGeneration: Bool = false
         var codeInterpreter: Bool = false
         var memory: Bool = false
+        /// When `true`, signals the server to inject the admin-configured
+        /// `VOICE_MODE_PROMPT_TEMPLATE` as a system message (OpenWebUI middleware).
+        var voice: Bool = false
 
         /// Whether any feature is enabled. Used to decide whether to include
         /// the `features` object in the request at all.
         var hasAnyEnabled: Bool {
-            webSearch || imageGeneration || codeInterpreter || memory
+            webSearch || imageGeneration || codeInterpreter || memory || voice
         }
     }
 
@@ -365,6 +368,7 @@ struct ChatCompletionRequest: Sendable {
         // falls back to model defaults. Matches web client behavior where
         // memory is sent based purely on the user's account setting.
         feat["memory"] = f.memory
+        feat["voice"] = f.voice
         data["features"] = feat
 
         return data

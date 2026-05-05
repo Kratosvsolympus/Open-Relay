@@ -670,13 +670,13 @@ final class ChannelViewModel {
         let removedIdx = messages.firstIndex(where: { $0.id == id })
         let removedMsg = removedIdx.map { messages[$0] }
         if let idx = removedIdx {
-            withAnimation(.messageRemove) { messages.remove(at: idx) }
+            withAnimation(.messageRemove) { _ = messages.remove(at: idx) }
         }
         
         let removedThreadIdx = threadMessages.firstIndex(where: { $0.id == id })
         let removedThreadMsg = removedThreadIdx.map { threadMessages[$0] }
         if let idx = removedThreadIdx {
-            withAnimation(.messageRemove) { threadMessages.remove(at: idx) }
+            withAnimation(.messageRemove) { _ = threadMessages.remove(at: idx) }
         }
         
         do {

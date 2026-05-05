@@ -297,6 +297,13 @@ enum ToolCallParser {
             // --- Phase 1: scan the opening tag in quote-aware mode ---
             // We walk forward from `<details` until we find the `>` that closes
             // the opening tag, respecting quoted attribute values.
+            //
+            // We also collect the opening-tag text so we can check for a
+            // recognised `type` attribute (tool_calls / reasoning).  Plain HTML
+            // <details> elements (e.g. inside VIZ HTML content) must NOT be
+            // consumed — if we swallow them the VIZ text gets split across
+            // multiple text segments, breaking VizMarkerParser's ability to find
+            // a complete @@@VIZ-START … @@@VIZ-END block.
             var j = tagNameEnd
             var inQuote: Character? = nil
             var openingTagEnd: String.Index? = nil
@@ -337,6 +344,23 @@ enum ToolCallParser {
                 // Opening tag not yet closed — mid-stream, skip and stop scanning
                 // (everything from here on is still arriving)
                 break
+            }
+
+            // ── Type-guard: only match OpenWebUI's <details type="..."> blocks ──
+            // Plain HTML <details> elements (e.g. inside VIZ HTML content between
+            // @@@VIZ-START and @@@VIZ-END) must pass through as regular text.
+            // If we swallow them, the VIZ text gets split across multiple text
+            // segments and VizMarkerParser never finds a complete block.
+            let openingTagStr = String(content[blockStart..<bodyStart])
+            let openingTagLower = openingTagStr.lowercased()
+            let isToolCallsBlock  = openingTagLower.contains("type=\"tool_calls\"")
+                                 || openingTagLower.contains("type='tool_calls'")
+            let isReasoningBlock  = openingTagLower.contains("type=\"reasoning\"")
+                                 || openingTagLower.contains("type='reasoning'")
+            guard isToolCallsBlock || isReasoningBlock else {
+                // Not an OpenWebUI block — skip past the opening `>` and keep scanning
+                i = bodyStart
+                continue
             }
 
             // --- Phase 2: scan for the matching </details> tracking nesting ---
@@ -2504,24 +2528,34 @@ struct AssistantMessageContent: View {
     /// property during body evaluation is safe because SwiftUI only tracks
     /// `@State`/`@Observable` value changes, not internal class mutations.
     private final class ParseCache {
-        var lastLength: Int = -1
+        /// utf8.count of the last cached content (O(1) — Swift caches this internally).
+        /// We use utf8.count rather than hashValue because hashValue is O(N)
+        /// (walks all grapheme clusters), which is the main source of per-frame CPU cost.
+        /// When the count matches, we also do a fast pointer/identity check via
+        /// `lastContent` before falling back to `==` to handle the rare case where
+        /// the byte count is stable but content changed (e.g. streaming attribute edits).
+        var lastByteCount: Int = -1
+        /// Cached content string for identity-level equality guard.
+        var lastContent: String = ""
         var lastResult: ToolCallParser.OrderedParseResult?
     }
 
     var body: some View {
-        // Cache key uses content hash so any change — including attribute
-        // value changes like done="false" → done="true" that leave the byte
-        // count identical — triggers a fresh parse. Previously using
-        // content.utf8.count caused stale isDone=false results to be returned
-        // after streaming completed, keeping the spinner running indefinitely
-        // and blocking embed rendering (which is guarded by isDone == true).
-        let cacheKey = content.hashValue
+        // Cache key: utf8.count is O(1) (Swift caches it on the String's internal
+        // storage). When count matches we do a fast String == check to guard against
+        // the rare case where byte count is identical but content differs (e.g.
+        // done="false" → done="true" with equal byte count). Because the string is
+        // the same object during a cache-hit frame the == fast-paths to pointer equality
+        // in most cases, costing essentially zero.
+        let byteCount = content.utf8.count
         let ordered: ToolCallParser.OrderedParseResult = {
-            if cacheKey == parseCache.lastLength, let cached = parseCache.lastResult {
+            if byteCount == parseCache.lastByteCount && content == parseCache.lastContent,
+               let cached = parseCache.lastResult {
                 return cached
             }
             let result = ToolCallParser.parseOrdered(content)
-            parseCache.lastLength = cacheKey
+            parseCache.lastByteCount = byteCount
+            parseCache.lastContent = content
             parseCache.lastResult = result
             // Log segment count and VIZ presence once per parse
             let hasViz = content.contains("@@@VIZ-START")
@@ -2622,9 +2656,10 @@ struct AssistantMessageContent: View {
                         // between the </details> close and the @@@VIZ-START marker. On iOS this
                         // block has no purpose — InlineVisualizerView renders from the VIZ markers.
                         // Strip anything before @@@VIZ-START so it never reaches MarkdownView.
+                        // Use line-anchored detection to avoid false positives from markers
+                        // embedded inside HTML attributes or JS string literals in tool-call payloads.
                         let effectiveStr: String = {
-                            guard str.contains("@@@VIZ-START"),
-                                  let r = str.range(of: "@@@VIZ-START") else { return str }
+                            guard let r = VizMarkerParser.findRealStartMarkerRange(in: str) else { return str }
                             return String(str[r.lowerBound...])
                         }()
                         // Extract inline images from markdown ![alt](url) syntax.

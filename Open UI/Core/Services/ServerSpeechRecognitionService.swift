@@ -145,7 +145,7 @@ final class ServerSpeechRecognitionService {
         // .allowBluetooth enables HFP input for CarPlay / BT headset microphones.
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP])
+                                options: [.allowBluetoothHFP, .allowBluetoothA2DP])
         try session.setActive(true, options: .notifyOthersOnDeactivation)
 
         // Create temp file

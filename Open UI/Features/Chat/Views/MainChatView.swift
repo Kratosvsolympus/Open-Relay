@@ -1128,11 +1128,13 @@ struct MainChatView: View {
             dragOffset = 0
         }
         Haptics.play(.light)
+        let chatVM = dependencies.activeChatStore.viewModel(for: activeConversationId)
         Task {
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await listViewModel.refreshConversations() }
                 group.addTask { await listViewModel.folderViewModel.refreshFolders() }
                 group.addTask { await channelListVM.refreshChannels() }
+                group.addTask { await chatVM.fetchPinnedModels() }
             }
         }
     }

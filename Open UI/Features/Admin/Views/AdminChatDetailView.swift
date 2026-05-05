@@ -416,14 +416,7 @@ struct AdminChatDetailView: View {
         HStack(spacing: Spacing.xs) {
             HStack(spacing: -4) {
                 ForEach(Array(sources.prefix(3).enumerated()), id: \.offset) { _, source in
-                    Circle()
-                        .fill(theme.brandPrimary.opacity(0.2))
-                        .frame(width: 18, height: 18)
-                        .overlay(
-                            Text(String((source.title ?? source.url ?? "?").prefix(1)).uppercased())
-                                .scaledFont(size: 8, weight: .bold)
-                                .foregroundStyle(theme.brandPrimary)
-                        )
+                    sourceIconBadge(source: source)
                 }
             }
             Text("\(sources.count) Source\(sources.count == 1 ? "" : "s")")
@@ -434,6 +427,44 @@ struct AdminChatDetailView: View {
         .padding(.vertical, Spacing.xs)
         .background(theme.surfaceContainer.opacity(0.6))
         .clipShape(Capsule())
+    }
+
+    @ViewBuilder
+    private func sourceIconBadge(source: ChatSourceReference) -> some View {
+        let domain: String? = {
+            guard let url = source.resolvedURL,
+                  let parsed = URL(string: url),
+                  let host = parsed.host, !host.isEmpty else { return nil }
+            return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        }()
+
+        if let domain {
+            AsyncImage(url: URL(string: "https://www.google.com/s2/favicons?sz=32&domain=\(domain)")) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 18, height: 18)
+                        .clipShape(Circle())
+                default:
+                    letterAvatarBadge(source: source)
+                }
+            }
+        } else {
+            letterAvatarBadge(source: source)
+        }
+    }
+
+    private func letterAvatarBadge(source: ChatSourceReference) -> some View {
+        Circle()
+            .fill(theme.brandPrimary.opacity(0.2))
+            .frame(width: 18, height: 18)
+            .overlay(
+                Text(String((source.title ?? source.url ?? "?").prefix(1)).uppercased())
+                    .scaledFont(size: 8, weight: .bold)
+                    .foregroundStyle(theme.brandPrimary)
+            )
     }
 
     // MARK: - Error View

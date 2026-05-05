@@ -54,6 +54,23 @@ struct AccessibilitySettingsView: View {
                     .padding(Spacing.md)
                 }
 
+                // Input Text Scale
+                SettingsSection(
+                    header: "Input Box Text",
+                    footer: "Adjusts the font size in the message composer for chat and channels."
+                ) {
+                    scaleSlider(
+                        value: Binding(
+                            get: { manager.inputTextScale },
+                            set: { manager.inputTextScale = $0 }
+                        ),
+                        range: AccessibilityManager.inputScaleRange,
+                        icon: "keyboard",
+                        label: "Input Text"
+                    )
+                    .padding(Spacing.md)
+                }
+
                 // UI Scale
                 SettingsSection(
                     header: "UI Scale",
@@ -184,6 +201,35 @@ struct AccessibilitySettingsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
 
+                Rectangle()
+                    .fill(theme.divider)
+                    .frame(height: 0.5)
+
+                // Sample input composer (input context)
+                HStack(spacing: Spacing.sm) {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(theme.surfaceContainer)
+                        .frame(height: max(34, 34 * manager.inputTextScale))
+                        .overlay(
+                            HStack {
+                                Text("Type a message…")
+                                    .font(.system(size: 15 * manager.inputTextScale, weight: .regular, design: .rounded))
+                                    .foregroundStyle(theme.textTertiary)
+                                    .padding(.horizontal, Spacing.sm)
+                                Spacer()
+                            }
+                        )
+
+                    Circle()
+                        .fill(theme.brandPrimary)
+                        .frame(width: 30 * manager.uiScale, height: 30 * manager.uiScale)
+                        .overlay(
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 12 * manager.uiScale, weight: .bold))
+                                .foregroundStyle(.white)
+                        )
+                }
+
                 // Sample action buttons (UI context)
                 HStack(spacing: 8 * manager.uiScale) {
                     ForEach(["doc.on.doc", "arrow.clockwise", "speaker.wave.2"], id: \.self) { icon in
@@ -210,6 +256,7 @@ struct AccessibilitySettingsView: View {
         .animation(.easeInOut(duration: 0.2), value: manager.contentTextScale)
         .animation(.easeInOut(duration: 0.2), value: manager.listTextScale)
         .animation(.easeInOut(duration: 0.2), value: manager.uiScale)
+        .animation(.easeInOut(duration: 0.2), value: manager.inputTextScale)
     }
 
     // MARK: - Presets Row

@@ -52,7 +52,7 @@ struct ChannelInputField: View {
     private static let inputBaseFontSize: CGFloat = 14
 
     private var scaledInputFont: UIFont {
-        let scale = accessibilityScale.scale(for: .content)
+        let scale = accessibilityScale.scale(for: .input)
         let size = round(Self.inputBaseFontSize * scale * 10) / 10
         let base = UIFont.systemFont(ofSize: size, weight: .regular)
         if let rounded = base.fontDescriptor.withDesign(.rounded) {

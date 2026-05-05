@@ -72,6 +72,16 @@ final class AccessibilityManager {
             case .extraLarge:  return 1.25
             }
         }
+
+        var inputScale: CGFloat {
+            switch self {
+            case .compact:     return 0.9
+            case .standard:    return 1.0
+            case .comfortable: return 1.1
+            case .large:       return 1.2
+            case .extraLarge:  return 1.35
+            }
+        }
     }
 
     // MARK: - Font Context
@@ -84,6 +94,8 @@ final class AccessibilityManager {
         case list
         /// Buttons, labels, badges, captions, system chrome
         case ui
+        /// Input box composer text (chat and channel)
+        case input
     }
 
     // MARK: - State
@@ -103,6 +115,11 @@ final class AccessibilityManager {
         didSet { save() }
     }
 
+    /// Scale for the message input composer box (0.8–1.5).
+    var inputTextScale: CGFloat {
+        didSet { save() }
+    }
+
     // MARK: - Computed Helpers
 
     /// Returns the scale factor for the given font context.
@@ -111,6 +128,7 @@ final class AccessibilityManager {
         case .content: return contentTextScale
         case .list:    return listTextScale
         case .ui:      return uiScale
+        case .input:   return inputTextScale
         }
     }
 
@@ -119,6 +137,7 @@ final class AccessibilityManager {
         abs(contentTextScale - 1.0) > 0.01
             || abs(listTextScale - 1.0) > 0.01
             || abs(uiScale - 1.0) > 0.01
+            || abs(inputTextScale - 1.0) > 0.01
     }
 
     /// The current preset that matches the scales, or nil if custom.
@@ -127,16 +146,18 @@ final class AccessibilityManager {
             abs(contentTextScale - preset.contentScale) < 0.01
                 && abs(listTextScale - preset.listScale) < 0.01
                 && abs(uiScale - preset.uiScale) < 0.01
+                && abs(inputTextScale - preset.inputScale) < 0.01
         }
     }
 
     // MARK: - Actions
 
-    /// Applies a preset, setting all three scales at once.
+    /// Applies a preset, setting all scales at once.
     func apply(preset: Preset) {
         contentTextScale = preset.contentScale
         listTextScale = preset.listScale
         uiScale = preset.uiScale
+        inputTextScale = preset.inputScale
     }
 
     /// Resets all scales to defaults (1.0).
@@ -144,6 +165,7 @@ final class AccessibilityManager {
         contentTextScale = 1.0
         listTextScale = 1.0
         uiScale = 1.0
+        inputTextScale = 1.0
     }
 
     // MARK: - Persistence
@@ -151,6 +173,7 @@ final class AccessibilityManager {
     private static let contentScaleKey = "openui.accessibility.contentTextScale"
     private static let listScaleKey = "openui.accessibility.listTextScale"
     private static let uiScaleKey = "openui.accessibility.uiScale"
+    private static let inputScaleKey = "openui.accessibility.inputTextScale"
 
     init() {
         let storedContent = UserDefaults.standard.double(forKey: Self.contentScaleKey)
@@ -161,12 +184,16 @@ final class AccessibilityManager {
 
         let storedUI = UserDefaults.standard.double(forKey: Self.uiScaleKey)
         self.uiScale = storedUI > 0 ? CGFloat(storedUI) : 1.0
+
+        let storedInput = UserDefaults.standard.double(forKey: Self.inputScaleKey)
+        self.inputTextScale = storedInput > 0 ? CGFloat(storedInput) : 1.0
     }
 
     private func save() {
         UserDefaults.standard.set(Double(contentTextScale), forKey: Self.contentScaleKey)
         UserDefaults.standard.set(Double(listTextScale), forKey: Self.listScaleKey)
         UserDefaults.standard.set(Double(uiScale), forKey: Self.uiScaleKey)
+        UserDefaults.standard.set(Double(inputTextScale), forKey: Self.inputScaleKey)
     }
 }
 
@@ -179,4 +206,6 @@ extension AccessibilityManager {
     static let listScaleRange: ClosedRange<CGFloat> = 0.8...1.5
     /// Clamps UI scale to valid range.
     static let uiScaleRange: ClosedRange<CGFloat> = 0.85...1.3
+    /// Clamps input composer text scale to valid range.
+    static let inputScaleRange: ClosedRange<CGFloat> = 0.8...1.5
 }

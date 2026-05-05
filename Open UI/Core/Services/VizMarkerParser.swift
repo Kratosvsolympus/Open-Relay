@@ -39,6 +39,59 @@ enum VizMarkerParser {
     // HTML/JS content (e.g. `var END_MARK = '@@@VIZ-END'`).
     private static let endMarker   = "\n@@@VIZ-END"
 
+    // MARK: - False-positive detection
+
+    /// Returns `true` if the `@@@VIZ-START` occurrence at `range` in `text` is a
+    /// **real** marker (i.e. the plugin's actual output) rather than an embedded
+    /// occurrence inside HTML attributes, JS string literals, or tool-call payloads.
+    ///
+    /// Real markers are ALWAYS on their own line — preceded by `\n` or at
+    /// the very start of the string. Any other character before `@` means
+    /// it's embedded inside other content (e.g. `embeds="…@@@VIZ-START…"`).
+    private static func isRealMarker(_ range: Range<String.Index>, in text: String) -> Bool {
+        guard range.lowerBound > text.startIndex else { return true }
+        let charBefore = text[text.index(before: range.lowerBound)]
+        return charBefore == "\n"
+    }
+
+    /// Finds the first real (line-start-anchored) `@@@VIZ-START` in `slice`.
+    private static func findStartMarker(in slice: Substring) -> Range<Substring.Index>? {
+        var searchFrom = slice.startIndex
+        while searchFrom < slice.endIndex,
+              let r = slice.range(of: startMarker, range: searchFrom..<slice.endIndex) {
+            // Real markers must be at the start of the string or preceded by a newline.
+            if r.lowerBound > slice.startIndex {
+                let charBefore = slice[slice.index(before: r.lowerBound)]
+                if charBefore != "\n" {
+                    // Not on its own line — false positive. Keep searching.
+                    searchFrom = r.upperBound
+                    continue
+                }
+            }
+            return r
+        }
+        return nil
+    }
+
+    // MARK: - Public Helpers
+
+    /// Returns `true` if `text` contains a real (line-anchored) `@@@VIZ-START` marker.
+    /// Use this instead of `text.contains("@@@VIZ-START")` to avoid false positives
+    /// from markers embedded inside HTML attributes or JS string literals.
+    static func containsRealMarker(_ text: String) -> Bool {
+        guard text.contains(startMarker) else { return false }
+        return findStartMarker(in: text[text.startIndex...]) != nil
+    }
+
+    /// Finds the range of the first real (line-anchored) `@@@VIZ-START` marker in `text`.
+    /// Returns `nil` if no real marker is found.
+    static func findRealStartMarkerRange(in text: String) -> Range<String.Index>? {
+        guard text.contains(startMarker) else { return nil }
+        guard let subRange = findStartMarker(in: text[text.startIndex...]) else { return nil }
+        // Convert Substring.Index range to String.Index range (they're the same underlying indices)
+        return subRange.lowerBound..<subRange.upperBound
+    }
+
     // MARK: - Full Parse (post-streaming)
 
     /// Parses a fully-received message string into `[VizSegment]`.
@@ -52,7 +105,7 @@ enum VizMarkerParser {
         var segments: [VizSegment] = []
         var remaining = text[text.startIndex...]
 
-        while let startRange = remaining.range(of: startMarker) {
+        while let startRange = findStartMarker(in: remaining) {
             // Text before this VIZ block
             let before = String(remaining[remaining.startIndex..<startRange.lowerBound])
             if !before.isEmpty {
@@ -110,9 +163,10 @@ enum VizMarkerParser {
     /// O(1) amortized — only scans the string once. Returns a `StreamingState`
     /// so callers can decide how to render partial content without blocking.
     static func streamingParse(_ text: String) -> StreamingState {
-        guard let startRange = text.range(of: startMarker) else {
-            return .noMarkers
-        }
+        guard text.contains(startMarker) else { return .noMarkers }
+
+        let slice = text[text.startIndex...]
+        guard let startRange = findStartMarker(in: slice) else { return .noMarkers }
 
         let proseBeforeMarker = String(text[text.startIndex..<startRange.lowerBound])
 

@@ -59,6 +59,11 @@ final class ChatViewModel {
     }
     var selectedModelId: String?
     var isStreaming: Bool = false
+    /// When `true`, every `sendMessage()` call includes `features.voice = true`
+    /// in the request body so the server injects the admin-configured voice mode
+    /// system prompt (OpenWebUI `VOICE_MODE_PROMPT_TEMPLATE`).
+    /// Set by `VoiceCallViewModel.configure()` and reset in `endCall()`.
+    var isVoiceMode: Bool = false
     var isLoadingConversation: Bool = false
     var isLoadingModels: Bool = false
     /// Tasks managed by the model's built-in task tools (create_tasks / update_task).
@@ -5009,6 +5014,9 @@ final class ChatViewModel {
         if memoryEnabled {
             features.memory = true
         }
+        if isVoiceMode {
+            features.voice = true
+        }
 
         return features
     }
@@ -5230,13 +5238,21 @@ final class ChatViewModel {
                     return nil
                 }()
 
-                // Resolve title
+                // Resolve title — reject any value that is itself a URL (starts with
+                // "http"). Some providers store the page URL in the "name"/"title" field
+                // when no real title is available; those fall through to the domain
+                // extractor in displayLabel() instead of showing a raw URL as the pill label.
                 let title: String? = {
-                    if let n = meta["name"] as? String, !n.isEmpty { return n }
-                    if let t = meta["title"] as? String, !t.isEmpty { return t }
-                    if let n = baseSource["name"] as? String, !n.isEmpty { return n }
-                    if let t = baseSource["title"] as? String, !t.isEmpty { return t }
-                    if let id = idCandidate, !id.isEmpty { return id }
+                    func validTitle(_ s: String?) -> String? {
+                        guard let s, !s.isEmpty,
+                              !s.hasPrefix("http://"), !s.hasPrefix("https://") else { return nil }
+                        return s
+                    }
+                    if let n = validTitle(meta["name"] as? String) { return n }
+                    if let t = validTitle(meta["title"] as? String) { return t }
+                    if let n = validTitle(baseSource["name"] as? String) { return n }
+                    if let t = validTitle(baseSource["title"] as? String) { return t }
+                    if let id = idCandidate, !id.isEmpty, !id.hasPrefix("http") { return id }
                     return nil
                 }()
 
@@ -5663,6 +5679,12 @@ final class ChatViewModel {
             }) {
                 conversation?.messages[index].sources.append(source)
             }
+        }
+        // Mirror into streamingStore so IsolatedAssistantMessage has sources
+        // both during streaming AND in the post-stream handoff window before
+        // the final message commit propagates back through the view hierarchy.
+        if streamingStore.streamingMessageId == id {
+            streamingStore.appendSources(sources)
         }
     }
 

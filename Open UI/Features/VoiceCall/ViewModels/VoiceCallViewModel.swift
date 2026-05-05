@@ -118,6 +118,9 @@ final class VoiceCallViewModel {
         self.conversationManager = conversationManager
         self.chatViewModel = chatViewModel
         self.modelName = modelName
+        // Signal voice mode so every sendMessage() includes features.voice=true,
+        // causing the server to inject the admin-configured VOICE_MODE_PROMPT_TEMPLATE.
+        chatViewModel.isVoiceMode = true
     }
 
     // MARK: - Call Lifecycle
@@ -204,6 +207,10 @@ final class VoiceCallViewModel {
 
         // Disable speaker override so TTS outside a call behaves normally
         ttsService.speakerOverrideEnabled = false
+
+        // Reset voice mode flag so normal chat from the same ChatViewModel
+        // doesn't continue sending features.voice=true after the call ends.
+        chatViewModel?.isVoiceMode = false
 
         // CRITICAL: Clear all shared service callbacks so a stale VM reference
         // cannot restart the microphone after the call ends. Without this, the
@@ -468,8 +475,11 @@ final class VoiceCallViewModel {
         // Without .allowBluetooth the CarPlay / BT mic is not routed and STT hears silence.
         do {
             let session = AVAudioSession.sharedInstance()
+            // Do NOT use .defaultToSpeaker here — it overrides overrideOutputAudioPort(.none)
+            // on every cycle and prevents the speaker button from turning off.
+            // Speaker routing is controlled exclusively via applySpeakerOverride().
             try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                    options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP])
+                                    options: [.allowBluetoothHFP, .allowBluetoothA2DP])
             try session.setActive(true)
             applySpeakerOverride()
         } catch {
@@ -489,6 +499,9 @@ final class VoiceCallViewModel {
                 errorMessage = error.localizedDescription
                 return
             }
+            // Re-apply speaker preference — serverSTT.startListening() calls setCategory
+            // with .defaultToSpeaker internally, which resets overrideOutputAudioPort(.none).
+            applySpeakerOverride()
             // Monitor intensity from server STT recorder
             monitorServerSTTIntensity()
         } else {
@@ -501,6 +514,9 @@ final class VoiceCallViewModel {
                 errorMessage = error.localizedDescription
                 return
             }
+            // Re-apply speaker preference — speechService.startListening() calls setCategory
+            // with .defaultToSpeaker internally, which resets overrideOutputAudioPort(.none).
+            applySpeakerOverride()
             monitorAppleSTTIntensity()
         }
     }
@@ -569,8 +585,9 @@ final class VoiceCallViewModel {
         for attempt in 1...3 {
             do {
                 let session = AVAudioSession.sharedInstance()
+                // Do NOT use .defaultToSpeaker — see startListening() comment.
                 try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                        options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP])
+                                        options: [.allowBluetoothHFP, .allowBluetoothA2DP])
                 try session.setActive(true)
                 applySpeakerOverride()
                 break
@@ -620,11 +637,13 @@ final class VoiceCallViewModel {
         // Poll for streaming content — feed sentences to TTS pipeline as they arrive.
         //
         // IMPORTANT: During streaming, ChatViewModel routes every token delta into
-        // streamingStore.streamingContent (an isolated @Observable store) rather than
+        // the streamingStore (an isolated @Observable store) rather than
         // into conversation.messages[idx].content — this is a performance optimisation
         // that prevents all message views from re-evaluating on every token.
         // Reading messages.last?.content here would always see "" (the frozen placeholder)
         // until streaming fully completes. We must read directly from the streaming store.
+        // Use displayContent (the typewriter-drained content) for TTS — it's the
+        // same authoritative text, available from the thin @MainActor wrapper.
         var lastContent = ""
         while chatViewModel.isStreaming {
             guard !Task.isCancelled else {
@@ -636,7 +655,7 @@ final class VoiceCallViewModel {
             // for socket-based external streams that bypass the store.
             let newContent: String
             if chatViewModel.streamingStore.isActive {
-                newContent = chatViewModel.streamingStore.streamingContent
+                newContent = chatViewModel.streamingStore.displayContent
             } else {
                 newContent = chatViewModel.messages.last(where: { $0.role == .assistant })?.content ?? ""
             }

@@ -1,5 +1,23 @@
 # Changelog
 
+## v4.0 — May 5, 2026
+
+### What's New
+- Added dedicated Input Box Text size slider in Accessibility settings — independently scale the font in the chat and channel message composer.
+- A complete re-write of the streaming pipeline — Massively improved streaming performance. App should feel fully responsive while streaming. 
+
+### Improvements
+- Switching between chats should feel smoother. 
+- Screen now stays on while TTS is reading a response aloud, just like during voice calls.
+- Voice calls now respect the admin-configured Voice Mode prompt from OpenWebUI's interface settings — the model automatically receives the right system prompt to keep responses concise and speech-friendly.
+
+### Bug Fixes
+- Fixed nested code blocks rendering as plain text.
+- Fixed citation source icons showing as letter avatars instead of favicons.
+- Known Issue: Inline visualizer plugin is not correctly working with the new re-write and needs a bit more work. Continue using the native visualizer which works perfectly and much better than pluggin. In future, the pluggin support may be dropped as it requires lot of processing since its written for the webui (includes iframe code in the tool block) and causes lag and has no real benifit over the native visualization. 
+
+## Previous Builds
+
 ## v3.5 — May 3, 2026
 
 ### What's New

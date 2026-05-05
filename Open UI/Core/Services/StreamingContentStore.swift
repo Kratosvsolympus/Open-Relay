@@ -1,27 +1,53 @@
 import Foundation
-import QuartzCore
 import SwiftUI
 import os.log
 
-private let drainLog = Logger(subsystem: "com.openui", category: "DrainTick")
+// MARK: - StreamingContentStore (thin @MainActor observable wrapper)
 
-/// Isolates streaming message state from the main conversation model.
-
+/// Bridges between the background `StreamingPipeline` actor and the SwiftUI
+/// view layer. The only work done on the main thread is writing the fields
+/// received from the background actor into observable properties — no O(N)
+/// string scanning, no string slicing, no regex, nothing heavy.
 @MainActor @Observable
 final class StreamingContentStore {
-    // MARK: - Live Streaming State
+
+    // MARK: - Live Streaming State (read by views)
 
     /// The message ID currently being streamed. `nil` when idle.
     var streamingMessageId: String?
 
-    /// The full accumulated content from the server (ground truth).
-    /// Updated on every token — NOT read directly by the view during streaming.
-    private(set) var streamingContent: String = ""
+    // MARK: Pre-sliced display strings (all computed off-main by StreamingPipeline)
 
-    /// The content actually shown to the user — drained smoothly from
-    /// `streamingContent` by the proportional drain display link.
-    /// Views should read THIS property, not `streamingContent`.
+    /// Full typewriter-drained content. Views should read sliced variants below instead.
     var displayContent: String = ""
+
+    /// Effective frozen boundary = max(tool, reasoning) offsets. 0 when no closed block yet.
+    var frozenBoundary: Int = 0
+
+    /// displayContent[..<frozenBoundary] — stable tool/reasoning HTML. "" when frozenBoundary==0.
+    var frozenContent: String = ""
+
+    /// displayContent[frozenBoundary...] — tiny live prose tail. "" when frozenBoundary==0.
+    var liveTail: String = ""
+
+    /// Within liveTail: settled paragraphs up to prose boundary. "" when N/A.
+    var liveTailFrozenProse: String = ""
+
+    /// Within liveTail: current in-progress paragraph. "" when N/A.
+    var liveTailLiveProse: String = ""
+
+    /// Pure-prose (no tool/reasoning): displayContent[..<proseBoundary]. "" when N/A.
+    var pureFrozenProse: String = ""
+
+    /// Pure-prose (no tool/reasoning): displayContent[proseBoundary...]. "" when N/A.
+    var pureLiveProse: String = ""
+
+    // MARK: Boundary offsets (for has-special-content checks in the view)
+    var frozenToolBoundaryOffset: Int = 0
+    var frozenReasoningBoundaryOffset: Int = 0
+    var frozenProseBoundaryOffset: Int = 0
+
+    // MARK: - Metadata
 
     /// Status history (tool calls, web search progress, etc.)
     var streamingStatusHistory: [ChatStatusUpdate] = []
@@ -32,157 +58,48 @@ final class StreamingContentStore {
     /// Error that occurred during streaming, if any.
     var streamingError: ChatMessageError?
 
-    /// Whether streaming is actively in progress.
-    /// Remains `true` during finishing mode (buffer draining after server done).
+    /// Whether streaming is actively in progress (including finishing drain).
     var isActive: Bool = false
 
     /// The model ID for the streaming message.
     var streamingModelId: String?
 
-    /// Character offset into `displayContent` immediately after the last closed
-    /// `<details type="tool_calls">` block. Once set, this value only increases.
-    ///
-    /// - `0` means no tool call block has been fully closed yet.
-    /// - `> 0` means everything before this offset is frozen tool-call HTML that
-    ///   will never change again. Views can pass only `liveTextTail` to
-    ///   `StreamingMarkdownView` instead of the full (potentially multi-KB) string.
-    private(set) var frozenToolBoundaryOffset: Int = 0
+    // MARK: - Private: background actor
 
-    /// Character offset into `displayContent` immediately after the last closed
-    /// `<details type="reasoning">` block. Mirrors `frozenToolBoundaryOffset` but
-    /// for thinking/reasoning content.
-    ///
-    /// - `0` means no reasoning block has been fully closed yet.
-    /// - `> 0` means everything before this offset is frozen reasoning HTML that
-    ///   will never change again. Combined with `frozenToolBoundaryOffset` via
-    ///   `max()` to determine the effective frozen boundary for `liveTextTail`.
-    private(set) var frozenReasoningBoundaryOffset: Int = 0
+    private var pipeline: StreamingPipeline?
 
-    /// Character offset of the last paragraph boundary (`\n\n`) that is safe to
-    /// freeze during pure-prose streaming (no tool calls, no VIZ markers).
-    ///
-    /// Updated in `drainTick()` with **hysteresis**: only advances when the new
-    /// candidate boundary is ≥ `proseBoundaryHysteresis` chars ahead of the current
-    /// value. This prevents a layout-reflow snap on every single paragraph; instead
-    /// the frozen/live split only shifts once every several hundred characters.
-    ///
-    /// - `0` means the prose is too short to benefit from splitting.
-    /// - Reset to `0` on `beginStreaming()` / `completeCleanup()`.
-    private(set) var frozenProseBoundaryOffset: Int = 0
+    /// The full raw server content (stored so `endStreaming()` can return it).
+    private var rawServerContent: String = ""
 
-    /// Minimum number of characters the paragraph boundary must advance before
-    /// `frozenProseBoundaryOffset` is updated. Prevents per-paragraph layout snaps.
-    private static let proseBoundaryHysteresis: Int = 400
+    // MARK: - Begin / Update / End
 
-    /// The substring of `displayContent` that starts after the effective frozen
-    /// boundary (`max(frozenToolBoundaryOffset, frozenReasoningBoundaryOffset)`).
-    /// This is the only part of the message still changing on every display-link tick,
-    /// so views should pass this (tiny) string to `StreamingMarkdownView` rather than
-    /// the full (potentially multi-KB) string.
-    var liveTextTail: String {
-        let boundary = max(frozenToolBoundaryOffset, frozenReasoningBoundaryOffset)
-        guard boundary > 0 else { return displayContent }
-        let dc = displayContent
-        guard dc.count > boundary else { return "" }
-        let idx = dc.index(dc.startIndex, offsetBy: boundary)
-        return String(dc[idx...])
-    }
-
-    // MARK: - Drain State
-
-    private var displayLink: CADisplayLink?
-
-    /// Fractional carry-over from the previous drain tick.
-    /// Accumulates sub-integer portions so no chars are lost at low server speeds.
-    private var drainAccumulator: Double = 0
-
-    /// Constant chars-per-frame rate, locked when a burst of tokens arrives.
-    /// Persists across frames until the next burst recalculates it, ensuring
-    /// the buffer drains uniformly over the EMA-estimated inter-burst gap.
-    private var steadyRate: Double = 0
-
-    /// Tracks `streamingContent.count` from the previous frame to detect
-    /// when new tokens have arrived (burst detection).
-    private var lastKnownTotal: Int = 0
-
-    /// Exponential moving average of the inter-burst interval in display-link
-    /// frames. Seed at 25 (≈417ms) — matches the typical 400ms gap at 20 tok/s.
-    /// Updated on every burst: EMA = 0.3 × observed + 0.7 × EMA
-    private var burstIntervalEMA: Double = 25
-
-    /// Frame counter incremented every tick, reset to 0 on each burst arrival.
-    /// Used to measure the actual gap between consecutive token bursts.
-    private var framesSinceLastBurst: Int = 0
-
-    /// True until the first real token burst arrives. Prevents the model's
-    /// thinking time (can be seconds → hundreds of frames) from polluting the
-    /// EMA with a wildly inflated inter-burst interval.
-    private var isFirstBurst: Bool = true
-
-    /// True once the server has finished sending tokens. The display link
-    /// keeps running to drain remaining buffer — no new tokens will arrive.
-    /// Buffer is NOT instantly flushed; drain continues at the same rate.
-    private var isFinishing: Bool = false
-
-    /// Hard cap on chars revealed per frame, regardless of server speed.
-    /// At 60fps: 7.0 chars/frame = 360 chars/sec — comfortable typewriter pace.
-    /// Prevents fast models from dumping large bursts instantly, which destroys
-    /// the character-by-character feel. The buffer simply grows and drains steadily.
-    private let maxCharsPerFrame: Double = 7.0
-
-    /// True from the frame that VIZ fast-forward is first completed (displayContent
-    /// advanced to vizEndOffset) until the next drainTick where we start fresh.
-    /// Used to trigger a single drain-state reset at the streaming→typewriter boundary.
-    private var vizTransitionPending: Bool = false
-
-    /// Throttle counter for per-frame drain logs — logs every 30 frames (~0.5s).
-    private var drainLogCounter: Int = 0
-
-    // MARK: - CADisplayLink (synchronous — no Task trampoline)
-
-    private final class DisplayLinkTarget: NSObject {
-        weak var store: StreamingContentStore?
-        @objc func tick(_ link: CADisplayLink) {
-            guard let store else { return }
-            // CADisplayLink fires on the main RunLoop (main thread).
-            // assumeIsolated lets us call the @MainActor method synchronously
-            // without scheduling an async Task — eliminates tick-queuing jitter.
-            MainActor.assumeIsolated { store.drainTick() }
-        }
-    }
-
-    private var displayLinkTarget: DisplayLinkTarget?
-
-    // MARK: - Methods
-
-    /// Starts a new streaming session for a given message.
+    /// Starts a new streaming session.
     func beginStreaming(messageId: String, modelId: String?) {
         streamingMessageId = messageId
-        streamingContent = ""
-        displayContent = ""
-        frozenToolBoundaryOffset = 0
-        frozenReasoningBoundaryOffset = 0
-        frozenProseBoundaryOffset = 0
+        streamingModelId = modelId
+        resetSnapshotFields()
         streamingStatusHistory = []
         streamingSources = []
         streamingError = nil
-        streamingModelId = modelId
         isActive = true
-        isFinishing = false
-        startDisplayLink()
+        rawServerContent = ""
+
+        let p = StreamingPipeline { [weak self] snapshot in
+            guard let self else { return }
+            self.applySnapshot(snapshot)
+        }
+        pipeline = p
+        Task { await p.begin() }
     }
 
-    /// Updates the streaming content (called on each token batch from the server).
+    /// Updates the raw server content (called per token batch).
     func updateContent(_ content: String) {
-        // Ignore late tokens arriving after the server has signalled completion.
-        // Socket events are async and can race with endStreaming(); this guard
-        // prevents a stale token from growing streamingContent while isFinishing
-        // is true, which would create a buffer the drain algorithm never catches up to.
-        guard !isFinishing else { return }
-        streamingContent = content
+        rawServerContent = content
+        let p = pipeline
+        Task { await p?.append(content) }
     }
 
-    /// Appends a status update (tool calls, search progress, etc.)
+    /// Appends a status update.
     func appendStatus(_ status: ChatStatusUpdate) {
         if let idx = streamingStatusHistory.firstIndex(
             where: { $0.action == status.action && $0.done != true }
@@ -212,51 +129,34 @@ final class StreamingContentStore {
         streamingError = error
     }
 
-    /// Ends the streaming session.
-    ///
-    /// Returns the full `StreamingResult` immediately so the caller can write
-    /// the authoritative content to the conversation model. However, the
-    /// display link is kept alive in "finishing" mode — the remaining buffered
-    /// characters drain at the **same rate** as during active streaming.
-    /// Once the visible buffer is empty the store cleans itself up automatically.
-    ///
-    /// For abort/cancel paths use `abortStreaming()` which instantly flushes.
+    /// Ends the streaming session gracefully.
     @discardableResult
     func endStreaming() -> StreamingResult {
         let result = StreamingResult(
             messageId: streamingMessageId,
-            content: streamingContent,
+            content: rawServerContent,
             statusHistory: streamingStatusHistory,
             sources: streamingSources,
             error: streamingError
         )
-
-        // If there are still chars to drain, enter finishing mode.
-        // The display link keeps running; cleanup happens in drainTick().
-        if displayContent.count < streamingContent.count {
-            isFinishing = true
-            // isActive stays true — the streaming view remains visible
-        } else {
-            // Nothing left to drain — clean up immediately
-            completeCleanup()
-        }
-
+        let p = pipeline
+        Task { await p?.finish() }
         return result
     }
 
-    /// Immediately flushes all remaining buffer and stops the display link.
-    /// Use this for abort / cancel / error paths where smooth drain is undesirable.
-    /// Returns the full `StreamingResult` so callers can persist partial content.
+    /// Immediately flushes the buffer and stops the pipeline.
     @discardableResult
     func abortStreaming() -> StreamingResult {
+        let p = pipeline
+        pipeline = nil
+        Task { _ = await p?.abort() }
         let result = StreamingResult(
             messageId: streamingMessageId,
-            content: streamingContent,
+            content: rawServerContent,
             statusHistory: streamingStatusHistory,
             sources: streamingSources,
             error: streamingError
         )
-        stopDisplayLink()
         completeCleanup()
         return result
     }
@@ -269,700 +169,54 @@ final class StreamingContentStore {
         let error: ChatMessageError?
     }
 
+    // MARK: - Snapshot application (called on @MainActor by pipeline)
+
+    private func applySnapshot(_ snapshot: StreamingSnapshot) {
+        if snapshot.isActive {
+            displayContent               = snapshot.displayContent
+            frozenBoundary               = snapshot.frozenBoundary
+            frozenContent                = snapshot.frozenContent
+            liveTail                     = snapshot.liveTail
+            liveTailFrozenProse          = snapshot.liveTailFrozenProse
+            liveTailLiveProse            = snapshot.liveTailLiveProse
+            pureFrozenProse              = snapshot.pureFrozenProse
+            pureLiveProse                = snapshot.pureLiveProse
+            frozenToolBoundaryOffset     = snapshot.frozenToolBoundaryOffset
+            frozenReasoningBoundaryOffset = snapshot.frozenReasoningBoundaryOffset
+            frozenProseBoundaryOffset    = snapshot.frozenProseBoundaryOffset
+        } else {
+            completeCleanup()
+        }
+    }
+
     // MARK: - Internal cleanup
 
-    private func completeCleanup() {
-        streamingMessageId = nil
-        streamingContent = ""
+    private func resetSnapshotFields() {
         displayContent = ""
+        frozenBoundary = 0
+        frozenContent = ""
+        liveTail = ""
+        liveTailFrozenProse = ""
+        liveTailLiveProse = ""
+        pureFrozenProse = ""
+        pureLiveProse = ""
         frozenToolBoundaryOffset = 0
         frozenReasoningBoundaryOffset = 0
         frozenProseBoundaryOffset = 0
+    }
+
+    private func completeCleanup() {
+        pipeline = nil
+        streamingMessageId = nil
+        rawServerContent = ""
+        resetSnapshotFields()
         streamingStatusHistory = []
-        streamingSources = []
+        // NOTE: streamingSources is intentionally NOT cleared here.
+        // It persists until the next beginStreaming() so IsolatedAssistantMessage
+        // can fall back to them during the brief window when isActive=false but
+        // message.sources hasn't been committed yet.
         streamingError = nil
         streamingModelId = nil
         isActive = false
-        isFinishing = false
-        stopDisplayLink()
     }
-
-    // MARK: - CADisplayLink
-
-    private func startDisplayLink() {
-        stopDisplayLink()
-        drainAccumulator = 0
-        steadyRate = 0
-        lastKnownTotal = 0
-        burstIntervalEMA = 25
-        framesSinceLastBurst = 0
-        isFirstBurst = true
-        vizTransitionPending = false
-        let target = DisplayLinkTarget()
-        target.store = self
-        displayLinkTarget = target
-        let link = CADisplayLink(target: target, selector: #selector(DisplayLinkTarget.tick(_:)))
-        link.add(to: .main, forMode: .common)
-        displayLink = link
-    }
-
-    private func stopDisplayLink() {
-        displayLink?.invalidate()
-        displayLink = nil
-        displayLinkTarget = nil
-        drainAccumulator = 0
-        steadyRate = 0
-        lastKnownTotal = 0
-        burstIntervalEMA = 25
-        framesSinceLastBurst = 0
-        isFirstBurst = true
-        vizTransitionPending = false
-    }
-
-    /// Called once per display frame synchronously on the main RunLoop.
-    ///
-    /// ## EMA burst-interval adaptive drain
-    ///
-    /// **Slow model (buffer ≤ 40):** EMA-adaptive constant-rate
-    ///   - On burst: update EMA with observed inter-burst frames, then
-    ///     `steadyRate = max(buffer / burstIntervalEMA, 0.3)`
-    ///   - Each frame: reveal steadyRate chars (constant, not proportional)
-    ///   - Buffer drains in exactly `burstIntervalEMA` frames → zero dead zone
-    ///
-    /// **Fast model (buffer > 40):** proportional drain
-    ///   - Each frame: max(steadyRate, buffer / 6) — proportional dominates
-    ///   - Behaviour identical to original — fast models unaffected
-    ///
-    /// **Finishing mode:** same algorithm, no rate change. Once buffer is
-    ///   fully drained, triggers completeCleanup() to stop the display link.
-    private func drainTick() {
-        let full = streamingContent
-        let totalCount = full.count
-
-        // `displayedCount` is read once here and kept in sync if the VIZ
-        // fast-forward block mutates `displayContent` mid-tick, so the drain
-        // arithmetic below always uses the correct post-fast-forward cursor.
-        var displayedCount = displayContent.count
-        var buffered = totalCount - displayedCount
-
-        // In finishing mode, if buffer is empty we're done — clean up.
-        if isFinishing && buffered == 0 {
-            completeCleanup()
-            return
-        }
-
-        framesSinceLastBurst += 1
-
-        // VIZ fast-forward: if the full content contains VIZ markers, bypass the
-        // typewriter drain for the VIZ block itself but NOT for text after @@@VIZ-END.
-        //
-        // Problem with the old "flush full" approach:
-        //   Once @@@VIZ-START appears, `full.contains("@@@VIZ-START")` is permanently
-        //   true for the rest of the stream. Every post-VIZ token got dumped instantly
-        //   (no typewriter drain), causing choppy text AND forcing MarkdownView to
-        //   re-parse the entire multi-KB string at 60fps → 104% CPU.
-        //
-        // New approach:
-        //   - VIZ-START seen, VIZ-END not yet arrived → flush entire buffer (VIZ is
-        //     still streaming, we want InlineVisualizerView to render incrementally).
-        //   - Both markers present → fast-forward displayContent only up to the end
-        //     of @@@VIZ-END (so the viz is fully locked in), then let the normal EMA
-        //     typewriter drain handle everything that follows. This restores the smooth
-        //     character-by-character feel for any prose written after the viz block.
-        if full.contains("@@@VIZ-START") {
-            // IMPORTANT: search for "\n@@@VIZ-END" (newline-prefixed) so we only
-            // match the standalone end marker that appears on its own line.
-            // The VIZ HTML content itself may contain "@@@VIZ-END" as a JavaScript
-            // string literal (e.g. `var END_MARK = '@@@VIZ-END'`) — a bare
-            // `range(of: "@@@VIZ-END")` would find those embedded occurrences and
-            // set vizEndOffset to the wrong position, causing the drain to typewriter
-            // raw VIZ JS/HTML as plain message text.
-            let standaloneEndMarker = "\n@@@VIZ-END"
-            if let endRange = full.range(of: standaloneEndMarker) {
-                // Both markers present — fast-forward only through \n@@@VIZ-END.
-                let vizEndOffset = full.distance(from: full.startIndex, to: endRange.upperBound)
-                if displayedCount < vizEndOffset {
-                    // displayContent hasn't reached VIZ-END yet — flush up to it.
-                    // Only actually write to displayContent if it changed — avoids
-                    // triggering a SwiftUI re-render every frame once VIZ-END is locked.
-                    let newDisplay = String(full[..<endRange.upperBound])
-                    if displayContent != newDisplay {
-                        displayContent = newDisplay
-                        drainLog.debug("🎨 [VIZ] VIZ-END reached: vizEndOffset=\(vizEndOffset) totalCount=\(totalCount) postVizBuffered=\(totalCount - vizEndOffset) isFinishing=\(self.isFinishing)")
-                    }
-                    // Update local cursor so the drain arithmetic below is correct.
-                    displayedCount = vizEndOffset
-                    buffered = totalCount - displayedCount
-                    // Mark that we just landed at VIZ-END — next tick resets drain state.
-                    vizTransitionPending = true
-                }
-                // Fall through to normal drain for text after @@@VIZ-END.
-                // (buffered is now full.count - vizEndOffset chars of post-viz prose.)
-            } else {
-                // @@@VIZ-START seen but standalone @@@VIZ-END not yet arrived —
-                // flush everything so InlineVisualizerView gets partial VIZ HTML.
-                // Only write to displayContent when it actually changes to avoid
-                // spurious SwiftUI re-renders on every display-link tick (60fps)
-                // while the VIZ block is rendering (can be 5-10 seconds of frames).
-                if displayContent.count != totalCount {
-                    displayContent = full
-                    drainLog.debug("🎨 [VIZ] VIZ streaming: flushed to \(totalCount) chars (no VIZ-END yet)")
-                }
-                if isFinishing { completeCleanup() }
-                return
-            }
-        }
-
-        // Tool call block fast-forward:
-        // When a <details type="tool_calls"> block is present but not yet closed
-        // (i.e., still streaming), bypassing the typewriter drain prevents the
-        // incomplete HTML from leaking into MarkdownView as raw text — which would
-        // cause expensive CommonMark parsing + syntax highlighting on the entire
-        // block on every display-link tick (60fps). This is especially costly for
-        // the Inline Visualizer tool which embeds thousands of characters of
-        // HTML/JS in the arguments attribute.
-        //
-        // NOTE: <details type="reasoning"> blocks are intentionally excluded here
-        // so that thinking/reasoning content streams character-by-character through
-        // the normal EMA typewriter drain for a smooth reading experience.
-        //
-        // Strategy: if the number of tool_calls <details opens exceeds the number
-        // of </details> closes (adjusted for reasoning blocks), there is at least
-        // one unclosed tool_calls block — suppress displayContent updates.
-        if hasUnclosedToolCallBlock(full) {
-            // While an unclosed <details type="tool_calls"> block is streaming,
-            // do NOT update displayContent at all. The ToolCallView renders tool
-            // metadata independently; no visible UI depends on the incomplete
-            // <details> HTML being in displayContent. Suppressing all updates here
-            // eliminates the ~25 KB/tick re-render cost that was causing lag during
-            // Inline Visualizer and other tool responses.
-            if isFinishing { completeCleanup() }
-            return
-        }
-
-        // Closed reasoning <details> fast-forward:
-        // Reasoning content (thinking blocks) is intentionally drained character-by-
-        // character while active (to show live thinking text). But once the reasoning
-        // block is fully closed, any remaining undisplayed reasoning HTML is skipped
-        // instantly — it can be 10–100 KB for long thinkers and nobody reads the raw
-        // HTML token-by-token. This mirrors the tool_calls fast-forward exactly.
-        if hasClosedReasoningBlock(full) {
-            if let lastReasoningEnd = Self.lastReasoningDetailsEnd(in: full) {
-                if displayedCount < lastReasoningEnd {
-                    let endIdx = full.index(full.startIndex, offsetBy: lastReasoningEnd)
-                    let newDisplay = String(full[..<endIdx])
-                    if displayContent != newDisplay {
-                        displayContent = newDisplay
-                    }
-                    displayedCount = lastReasoningEnd
-                    buffered = totalCount - displayedCount
-                    if frozenReasoningBoundaryOffset != lastReasoningEnd {
-                        frozenReasoningBoundaryOffset = lastReasoningEnd
-                    }
-                    drainLog.debug("⏩ [REASONING] Skipped to lastReasoningEnd=\(lastReasoningEnd) postBuffered=\(buffered) isFinishing=\(self.isFinishing)")
-                    // Reset EMA drain state so post-reasoning prose starts fresh.
-                    lastKnownTotal = totalCount
-                    burstIntervalEMA = 8
-                    framesSinceLastBurst = 0
-                    isFirstBurst = true
-                    drainAccumulator = 0
-                    steadyRate = 0
-                    return
-                }
-            }
-        }
-
-        // Closed tool_calls <details> fast-forward:
-        // Once all tool_calls blocks are fully closed, any tool HTML that
-        // displayContent hasn't yet revealed is skipped instantly. Tool output
-        // (arguments, results) can be 10–40 KB; typewriter-draining it would take
-        // 30–100+ seconds for data the user never reads character-by-character.
-        //
-        // Reasoning blocks are NOT skipped here — their content has already been
-        // streamed character-by-character via the normal typewriter drain above.
-        // Only skip up to the end of the last tool_calls </details> close.
-        if hasClosedToolCallBlock(full) {
-            if let lastToolCallCloseEnd = Self.lastToolCallDetailsEnd(in: full) {
-                if displayedCount < lastToolCallCloseEnd {
-                    // Jump displayContent to the end of the last tool_calls </details> instantly.
-                    let endIdx = full.index(full.startIndex, offsetBy: lastToolCallCloseEnd)
-                    let newDisplay = String(full[..<endIdx])
-                    if displayContent != newDisplay {
-                        displayContent = newDisplay
-                    }
-                    displayedCount = lastToolCallCloseEnd
-                    buffered = totalCount - displayedCount
-                    // Record the frozen boundary so views pass only liveTextTail to MarkdownView.
-                    if frozenToolBoundaryOffset != lastToolCallCloseEnd {
-                        frozenToolBoundaryOffset = lastToolCallCloseEnd
-                    }
-                    drainLog.debug("⏩ [TOOL_CALL] Skipped to lastToolCallEnd=\(lastToolCallCloseEnd) postBuffered=\(buffered) frozenBoundary=\(self.frozenToolBoundaryOffset) isFinishing=\(self.isFinishing)")
-                    // Reset EMA drain state so post-tool prose starts fresh —
-                    // prevents the giant skipped buffer from inflating lastKnownTotal
-                    // and making subsequent prose appear as one enormous burst.
-                    lastKnownTotal = totalCount
-                    burstIntervalEMA = 8
-                    framesSinceLastBurst = 0
-                    isFirstBurst = true
-                    drainAccumulator = 0
-                    steadyRate = 0
-                    // Return so the next tick starts a clean typewriter drain for
-                    // whatever prose follows the tool block (buffered > 0), or lets
-                    // the finishing check at the top handle cleanup (buffered == 0).
-                    return
-                }
-            }
-        }
-
-        // VIZ transition: we just completed the fast-forward to VIZ-END on the
-        // previous tick. Reset all drain state so the EMA algorithm starts fresh
-        // for post-VIZ prose rather than inheriting a stale lastKnownTotal (which
-        // was 0 since early-return paths never updated it) that would make newChars
-        // look like the entire 30KB message arrived in one burst.
-        //
-        // Additionally, if the server already finished while VIZ was rendering
-        // (isFinishing=true) and there's a large post-VIZ buffer, flush most of it
-        // immediately so the user sees the text appear quickly rather than waiting
-        // minutes for a 360-char/sec drain to catch up.
-        if vizTransitionPending {
-            vizTransitionPending = false
-            drainLog.debug("🔄 [VIZ→DRAIN] Transition fired: buffered=\(buffered) isFinishing=\(self.isFinishing) totalCount=\(totalCount)")
-            // Sync lastKnownTotal so newChars = 0 on this tick (clean slate).
-            lastKnownTotal = totalCount
-            // Fresh EMA seed — post-VIZ tokens are actively arriving.
-            burstIntervalEMA = 8
-            framesSinceLastBurst = 0
-            isFirstBurst = true
-            drainAccumulator = 0
-            steadyRate = 0
-
-            // Catch-up flush: if we're finishing (server done) and the post-VIZ
-            // buffer is large, advance displayContent to leave only a small tail
-            // (~2 seconds worth at 360 chars/sec) for typewriter effect.
-            // Without this, a 5000-char post-VIZ story would take ~14 seconds to
-            // drain even after the server finished sending it.
-            let catchUpThreshold = 200
-            if isFinishing && buffered > catchUpThreshold {
-                let keepForTypewriter = catchUpThreshold
-                let skipTo = totalCount - keepForTypewriter
-                let skipIdx = full.index(full.startIndex, offsetBy: skipTo)
-                displayContent = String(full[..<skipIdx])
-                displayedCount = skipTo
-                buffered = keepForTypewriter
-                lastKnownTotal = totalCount
-                drainLog.debug("🔄 [VIZ→DRAIN] Catch-up flush: skipped to \(skipTo), leaving \(keepForTypewriter) chars for typewriter")
-            }
-            // Return — start normal drain on the next tick with clean state.
-            return
-        }
-
-        // Burst detection: did streamingContent grow since the last frame?
-        // In finishing mode this will always be 0 (no new tokens arrive).
-        let newChars = totalCount - lastKnownTotal
-        lastKnownTotal = totalCount
-
-        if newChars > 0 {
-            if isFirstBurst {
-                // Skip EMA update on the very first burst to prevent the model's
-                // thinking time (potentially seconds = hundreds of frames) from
-                // inflating burstIntervalEMA and making the first drain far too slow.
-                // Use the seeded EMA value (25 frames ≈ 417ms) for the first burst.
-                isFirstBurst = false
-            } else {
-                // Update EMA with the observed inter-burst interval (frames).
-                // Clamp to [4, 60] — real inter-burst gaps are 12-36 frames at
-                // 20-60 tok/s. Ceiling of 60 (1s) prevents one long gap from
-                // dragging the EMA high and slowing subsequent bursts.
-                let observed = Double(max(4, min(framesSinceLastBurst, 60)))
-                burstIntervalEMA = 0.3 * observed + 0.7 * burstIntervalEMA
-            }
-            framesSinceLastBurst = 0
-
-            // Lock in a constant drain rate that spreads the current buffer
-            // across the EMA-estimated inter-burst gap. Floor of 0.3 lets
-            // very small bursts over long gaps trickle out gradually.
-            steadyRate = max(Double(buffered) / burstIntervalEMA, 0.3)
-            drainLog.debug("⚡️ [BURST] newChars=\(newChars) buffered=\(buffered) steadyRate=\(String(format: "%.2f", self.steadyRate)) ema=\(String(format: "%.1f", self.burstIntervalEMA)) isFinishing=\(self.isFinishing)")
-        }
-
-        // Threshold-gated dual mode:
-        // ≤ 40 chars → EMA-adaptive constant rate (slow model: zero dead zone)
-        // > 40 chars → proportional drain (fast model: keeps up with throughput)
-        var charsThisFrame: Double
-        if buffered <= 40 {
-            charsThisFrame = steadyRate
-
-            // Tail-reserve brake: when only 3 or fewer chars remain AND we are
-            // still actively receiving tokens (not finishing), apply a quadratic
-            // slow-down so the last chars linger until the next burst arrives.
-            // During finishing mode we skip this so the tail drains naturally.
-            if buffered <= 3 && !isFinishing {
-                let brakeFactor = Double(buffered) / 4.0  // 0.25 … 0.75
-                charsThisFrame = steadyRate * brakeFactor
-            }
-        } else {
-            charsThisFrame = max(steadyRate, Double(buffered) / burstIntervalEMA)
-        }
-        // Hard cap applied globally — both slow-model (EMA) and fast-model (proportional) paths.
-        charsThisFrame = min(charsThisFrame, maxCharsPerFrame)
-
-        drainAccumulator += charsThisFrame
-        let reveal = min(Int(drainAccumulator), buffered)
-        guard reveal > 0 else { return }
-        drainAccumulator -= Double(reveal)
-
-        drainLogCounter += 1
-        if drainLogCounter >= 30 {
-            drainLogCounter = 0
-            drainLog.debug("🖊 [DRAIN] reveal=\(reveal) buffered=\(buffered) steadyRate=\(String(format: "%.2f", self.steadyRate)) charsThisFrame=\(String(format: "%.2f", charsThisFrame)) isFinishing=\(self.isFinishing)")
-        }
-
-        let endOffset = displayedCount + reveal
-        let endIdx = full.index(full.startIndex, offsetBy: endOffset)
-        displayContent = String(full[..<endIdx])
-
-        // Prose paragraph-boundary freeze (hysteresis update):
-        // Only update frozenProseBoundaryOffset when there are no VIZ markers.
-        // Works for four cases (in priority order):
-        //   1. Post-tool prose (frozenToolBoundaryOffset > 0): search only the live tail
-        //      after the frozen tool boundary. Convert relative→absolute.
-        //   2. Post-reasoning prose (frozenReasoningBoundaryOffset > 0, no tool boundary):
-        //      search only after the frozen reasoning boundary. Convert relative→absolute.
-        //   3. Active reasoning streaming (no frozen boundaries, has "<details"):
-        //      search the full displayContent — reasoning text IS prose and benefits
-        //      from paragraph freezing even while inside a <details block.
-        //      Previously this case was excluded entirely, causing O(N) re-renders.
-        //   4. Pure prose (no boundaries, no <details): search full displayContent.
-        // In all cases only advance when candidate is ≥ proseBoundaryHysteresis ahead.
-        let newDC = displayContent
-        if !newDC.contains("@@@VIZ-START") {
-            let effectiveFrozenBoundary = max(frozenToolBoundaryOffset, frozenReasoningBoundaryOffset)
-            if effectiveFrozenBoundary > 0 {
-                // Post-tool or post-reasoning path: search only the live tail.
-                guard newDC.count > effectiveFrozenBoundary else { return }
-                let tailStartIdx = newDC.index(newDC.startIndex, offsetBy: effectiveFrozenBoundary)
-                let liveTailStr = String(newDC[tailStartIdx...])
-                let relCandidate = Self.lastParagraphBoundary(in: liveTailStr)
-                if relCandidate > 0 {
-                    let absCandidate = effectiveFrozenBoundary + relCandidate
-                    if absCandidate > frozenProseBoundaryOffset + Self.proseBoundaryHysteresis {
-                        frozenProseBoundaryOffset = absCandidate
-                    }
-                }
-            } else {
-                // Pure-prose path OR active-reasoning path: search full displayContent.
-                // Reasoning content is ordinary markdown text inside a <details wrapper;
-                // paragraph freezing reduces per-frame parse cost from O(totalChars) to
-                // O(currentParagraph) — critical for long thinkers (50,000+ char responses).
-                let candidate = Self.lastParagraphBoundary(in: newDC)
-                if candidate > frozenProseBoundaryOffset + Self.proseBoundaryHysteresis {
-                    frozenProseBoundaryOffset = candidate
-                }
-            }
-        } else if newDC.contains("\n@@@VIZ-END") {
-            // Post-VIZ prose: freeze paragraph boundaries in the tail after VIZ-END.
-            // Only search the text after \n@@@VIZ-END so we don't re-detect paragraph
-            // breaks inside the VIZ block itself. Convert relative→absolute offset,
-            // matching the same hysteresis-gated pattern as the post-tool prose branch.
-            let vizEndTag = "\n@@@VIZ-END"
-            if let vizRange = newDC.range(of: vizEndTag, options: .backwards) {
-                let tailStartIdx = vizRange.upperBound
-                let liveTailStr = String(newDC[tailStartIdx...])
-                let relCandidate = Self.lastParagraphBoundary(in: liveTailStr)
-                if relCandidate > 0 {
-                    let tailStartOffset = newDC.distance(from: newDC.startIndex, to: tailStartIdx)
-                    let absCandidate = tailStartOffset + relCandidate
-                    if absCandidate > frozenProseBoundaryOffset + Self.proseBoundaryHysteresis {
-                        frozenProseBoundaryOffset = absCandidate
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: - Details Block Detection
-
-    /// Result of a single-pass tool-call block analysis.
-    private struct ToolCallBlockFlags {
-        let hasUnclosed: Bool
-        let hasClosed: Bool
-    }
-
-    // Bug 2: Cache the tool-call block flags so the 6-independent-scan pipeline
-    // runs at most once per unique content length (content is append-only).
-    // The common case (same length as last tick) returns the cached result in O(1).
-    private var _toolCallFlagsCache: (contentCount: Int, flags: ToolCallBlockFlags)?
-
-    /// Analyses `content` for open/closed tool_call detail blocks in a **single linear pass**.
-    ///
-    /// Previously this was 6 independent `range(of:)` full-string loops called up to
-    /// twice per drain tick (hasUnclosed + hasClosedToolCallBlock calling hasUnclosed).
-    /// Now both flags are produced by one walk through the string, and the result is
-    /// cached by `streamingContent.count` — content is append-only, so a stable count
-    /// guarantees the same result.
-    private func toolCallFlags(for content: String) -> ToolCallBlockFlags {
-        let count = content.count
-        if let cached = _toolCallFlagsCache, cached.contentCount == count {
-            return cached.flags
-        }
-
-        guard content.contains("tool_calls") else {
-            let flags = ToolCallBlockFlags(hasUnclosed: false, hasClosed: false)
-            _toolCallFlagsCache = (count, flags)
-            return flags
-        }
-
-        var toolCallOpenCount = 0
-        var totalCloseCount = 0
-        var reasoningOpenCount = 0
-
-        // Single walk: count all three markers simultaneously.
-        var idx = content.startIndex
-        while idx < content.endIndex {
-            // Check for <details (opening tag prefix)
-            if content[idx] == "<" {
-                // Try to match "<details" efficiently without allocating substrings
-                let detailsTag = "<details"
-                if content[idx...].hasPrefix(detailsTag) {
-                    // Advance past "<details" and look for type attribute
-                    let afterDetails = content.index(idx, offsetBy: detailsTag.count, limitedBy: content.endIndex) ?? content.endIndex
-                    // Scan to end of this tag (up to ">")
-                    var tagEnd = afterDetails
-                    while tagEnd < content.endIndex && content[tagEnd] != ">" {
-                        tagEnd = content.index(after: tagEnd)
-                    }
-                    let tagContent = String(content[idx..<tagEnd])
-                    let lower = tagContent.lowercased()
-                    if lower.contains("tool_calls") {
-                        toolCallOpenCount += 1
-                    } else if lower.contains("type=\"reasoning\"") || lower.contains("type='reasoning'") {
-                        reasoningOpenCount += 1
-                    }
-                    idx = tagEnd < content.endIndex ? content.index(after: tagEnd) : content.endIndex
-                    continue
-                }
-                // Try to match "</details>" (closing tag)
-                let closeTag = "</details>"
-                if content[idx...].hasPrefix(closeTag) {
-                    totalCloseCount += 1
-                    idx = content.index(idx, offsetBy: closeTag.count, limitedBy: content.endIndex) ?? content.endIndex
-                    continue
-                }
-            }
-            idx = content.index(after: idx)
-        }
-
-        let toolCallCloseCount = max(0, totalCloseCount - reasoningOpenCount)
-        let hasUnclosed = toolCallOpenCount > toolCallCloseCount
-        let hasClosed = toolCallOpenCount > 0 && !hasUnclosed
-        let flags = ToolCallBlockFlags(hasUnclosed: hasUnclosed, hasClosed: hasClosed)
-        _toolCallFlagsCache = (count, flags)
-        return flags
-    }
-
-    /// Returns `true` if `content` contains at least one unclosed
-    /// `<details type="tool_calls">` block.
-    private func hasUnclosedToolCallBlock(_ content: String) -> Bool {
-        return toolCallFlags(for: content).hasUnclosed
-    }
-
-    /// Returns `true` if `content` contains at least one fully closed
-    /// `<details type="tool_calls">` block.
-    private func hasClosedToolCallBlock(_ content: String) -> Bool {
-        return toolCallFlags(for: content).hasClosed
-    }
-
-    /// Finds the character offset immediately after the last closing `</details>`
-    /// tag that belongs to a `<details type="tool_calls">` block.
-    ///
-    /// Strategy: walk backwards through `</details>` close tags, pairing each
-    /// with the nearest preceding `<details` open tag. Return the offset of the
-    /// last close that pairs with a tool_calls open.
-    ///
-    /// Returns `nil` if no closed tool_calls block is found.
-    private static func lastToolCallDetailsEnd(in content: String) -> Int? {
-        let closeTag = "</details>"
-        guard content.contains("tool_calls"), content.contains(closeTag) else { return nil }
-
-        // Collect all </details> close positions (end offsets) in forward order
-        var closeEnds: [String.Index] = []
-        var searchRange = content.startIndex..<content.endIndex
-        while let range = content.range(of: closeTag, options: .caseInsensitive, range: searchRange) {
-            closeEnds.append(range.upperBound)
-            searchRange = range.upperBound..<content.endIndex
-        }
-
-        // Collect all <details open positions (start offsets) in forward order
-        var openStarts: [String.Index] = []
-        searchRange = content.startIndex..<content.endIndex
-        let openTag = "<details"
-        while let range = content.range(of: openTag, options: .caseInsensitive, range: searchRange) {
-            openStarts.append(range.lowerBound)
-            searchRange = range.upperBound..<content.endIndex
-        }
-
-        guard !closeEnds.isEmpty && !openStarts.isEmpty else { return nil }
-
-        // Match closes to opens using a simple stack approach (forward pass)
-        // Each close at index i matches the open at index i (1:1 nesting order).
-        // Find the last close whose matching open contains "tool_calls".
-        var lastToolCallEnd: String.Index? = nil
-        let pairCount = min(closeEnds.count, openStarts.count)
-        for i in 0..<pairCount {
-            let openIdx = openStarts[i]
-            let closeIdx = closeEnds[i]
-            // Extract the opening tag text to check its type attribute
-            if let tagEnd = content.range(of: ">", range: openIdx..<content.endIndex) {
-                let tagText = String(content[openIdx..<tagEnd.upperBound])
-                if tagText.lowercased().contains("tool_calls") {
-                    lastToolCallEnd = closeIdx
-                }
-            }
-        }
-
-        guard let endIdx = lastToolCallEnd else { return nil }
-        return content.distance(from: content.startIndex, to: endIdx)
-    }
-
-    // MARK: - Reasoning Block Detection
-
-    /// Count-based cache for reasoning block flags (mirrors `_toolCallFlagsCache`).
-    private var _reasoningFlagsCache: (contentCount: Int, hasClosed: Bool)?
-
-    /// Returns `true` if `content` contains at least one fully closed
-    /// `<details type="reasoning">` block.
-    ///
-    /// Uses a count-based cache — content is append-only, so a stable count
-    /// guarantees the same result without rescanning.
-    private func hasClosedReasoningBlock(_ content: String) -> Bool {
-        let count = content.count
-        if let cached = _reasoningFlagsCache, cached.contentCount == count {
-            return cached.hasClosed
-        }
-        // Quick pre-check: must contain both a reasoning open and any close tag.
-        guard content.contains("reasoning"), content.contains("</details>") else {
-            _reasoningFlagsCache = (count, false)
-            return false
-        }
-
-        // Single-pass walk: count reasoning opens and total closes.
-        var reasoningOpenCount = 0
-        var totalCloseCount = 0
-        var toolCallOpenCount = 0
-        var idx = content.startIndex
-        while idx < content.endIndex {
-            if content[idx] == "<" {
-                let detailsTag = "<details"
-                if content[idx...].hasPrefix(detailsTag) {
-                    let afterDetails = content.index(idx, offsetBy: detailsTag.count, limitedBy: content.endIndex) ?? content.endIndex
-                    var tagEnd = afterDetails
-                    while tagEnd < content.endIndex && content[tagEnd] != ">" {
-                        tagEnd = content.index(after: tagEnd)
-                    }
-                    let tagContent = String(content[idx..<tagEnd]).lowercased()
-                    if tagContent.contains("reasoning") {
-                        reasoningOpenCount += 1
-                    } else if tagContent.contains("tool_calls") {
-                        toolCallOpenCount += 1
-                    }
-                    idx = tagEnd < content.endIndex ? content.index(after: tagEnd) : content.endIndex
-                    continue
-                }
-                let closeTag = "</details>"
-                if content[idx...].hasPrefix(closeTag) {
-                    totalCloseCount += 1
-                    idx = content.index(idx, offsetBy: closeTag.count, limitedBy: content.endIndex) ?? content.endIndex
-                    continue
-                }
-            }
-            idx = content.index(after: idx)
-        }
-
-        // Each reasoning open consumes one close; remaining closes go to tool_calls.
-        // A reasoning block is "closed" if its close was consumed (opens ≤ totalCloses).
-        let hasClosed = reasoningOpenCount > 0 && totalCloseCount >= reasoningOpenCount
-        _reasoningFlagsCache = (count, hasClosed)
-        return hasClosed
-    }
-
-    /// Finds the character offset immediately after the last closing `</details>`
-    /// tag that belongs to a `<details type="reasoning">` block.
-    /// Returns `nil` if no closed reasoning block is found.
-    private static func lastReasoningDetailsEnd(in content: String) -> Int? {
-        let closeTag = "</details>"
-        guard content.contains("reasoning"), content.contains(closeTag) else { return nil }
-
-        var closeEnds: [String.Index] = []
-        var searchRange = content.startIndex..<content.endIndex
-        while let range = content.range(of: closeTag, options: .caseInsensitive, range: searchRange) {
-            closeEnds.append(range.upperBound)
-            searchRange = range.upperBound..<content.endIndex
-        }
-
-        var openStarts: [String.Index] = []
-        searchRange = content.startIndex..<content.endIndex
-        let openTag = "<details"
-        while let range = content.range(of: openTag, options: .caseInsensitive, range: searchRange) {
-            openStarts.append(range.lowerBound)
-            searchRange = range.upperBound..<content.endIndex
-        }
-
-        guard !closeEnds.isEmpty && !openStarts.isEmpty else { return nil }
-
-        var lastReasoningEnd: String.Index? = nil
-        let pairCount = min(closeEnds.count, openStarts.count)
-        for i in 0..<pairCount {
-            let openIdx = openStarts[i]
-            if let tagEnd = content.range(of: ">", range: openIdx..<content.endIndex) {
-                let tagText = String(content[openIdx..<tagEnd.upperBound]).lowercased()
-                if tagText.contains("reasoning") {
-                    lastReasoningEnd = closeEnds[i]
-                }
-            }
-        }
-
-        guard let endIdx = lastReasoningEnd else { return nil }
-        return content.distance(from: content.startIndex, to: endIdx)
-    }
-
-    /// Returns the character offset of the end of the last completed paragraph
-    /// (double-newline boundary) that is safe to freeze — i.e., not inside an open
-    /// code fence and at least `minTailLength` characters from the current end.
-    ///
-    /// Returns `0` when the string is too short or no safe boundary is found.
-    ///
-    /// Used by `IsolatedAssistantMessage` to freeze settled prose paragraphs so that
-    /// only the current in-progress paragraph (~100-200 chars) is sent to MarkdownView
-    /// on each display-link tick (60fps). The frozen portion is rendered once per new
-    /// paragraph instead of re-parsing the whole multi-KB string every frame.
-    static func lastParagraphBoundary(in text: String, minTailLength: Int = 200) -> Int {
-        // Only trigger for messages long enough to benefit — short messages are cheap.
-        let minLength = minTailLength + 100
-        guard text.count > minLength else { return 0 }
-
-        // Restrict the search to the "safe zone": everything except the last
-        // minTailLength characters. This guarantees the live tail is non-empty
-        // after the split, giving the typewriter drain room to work.
-        let safeEndIdx = text.index(text.endIndex, offsetBy: -minTailLength)
-        let searchArea = text[text.startIndex..<safeEndIdx]
-
-        // Find the last paragraph break (double newline) in the safe zone.
-        guard let lastBlankLine = searchArea.range(of: "\n\n", options: .backwards) else { return 0 }
-
-        let boundaryIdx = lastBlankLine.upperBound
-
-        // Safety: never split inside an open code fence.
-        // Count ``` occurrences before the boundary; an odd count means we're inside.
-        let textBefore = text[..<boundaryIdx]
-        var fenceCount = 0
-        var cur = textBefore.startIndex
-        while let r = textBefore.range(of: "```", range: cur..<textBefore.endIndex) {
-            fenceCount += 1
-            cur = r.upperBound
-        }
-        guard fenceCount % 2 == 0 else { return 0 }
-
-        return text.distance(from: text.startIndex, to: boundaryIdx)
-    }
-
 }

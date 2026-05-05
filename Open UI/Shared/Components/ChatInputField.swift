@@ -394,7 +394,7 @@ struct ChatInputField: View {
 
     /// Rounded system font scaled by the user's accessibility content scale.
     private var scaledInputFont: UIFont {
-        let scale = accessibilityScale.scale(for: .content)
+        let scale = accessibilityScale.scale(for: .input)
         let size = round(Self.inputBaseFontSize * scale * 10) / 10
         let base = UIFont.systemFont(ofSize: size, weight: .regular)
         if let rounded = base.fontDescriptor.withDesign(.rounded) {

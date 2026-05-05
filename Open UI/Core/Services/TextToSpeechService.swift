@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import NaturalLanguage
+import UIKit
 
 /// Manages text-to-speech with support for both Apple's AVSpeechSynthesizer,
 /// on-device neural TTS (Kokoro or Qwen3), and server-side TTS.
@@ -73,6 +74,10 @@ final class TextToSpeechService: NSObject {
     /// When set to true, output is forced to the loudspeaker after each audio session setup.
     /// Set by VoiceCallViewModel to persist speaker routing through the TTS pipeline.
     var speakerOverrideEnabled: Bool = false
+
+    /// Tracks whether the TTS service itself has disabled the idle timer.
+    /// Prevents re-enabling auto-lock while a voice call is already holding it.
+    private var ttsHoldsIdleTimerLock: Bool = false
 
     func configureServerTTS(apiClient: APIClient?) {
         self.apiClient = apiClient
@@ -213,6 +218,7 @@ final class TextToSpeechService: NSObject {
                 }
                 self.state = .idle
                 self.isUsingKokoro = false
+                self.enableIdleTimer()
                 // Model stays loaded for fast re-use; unloaded only on background/explicit stop
                 self.onComplete?()
             }
@@ -266,6 +272,26 @@ final class TextToSpeechService: NSObject {
         }
     }
 
+    // MARK: - Idle Timer Helpers
+
+    /// Disables the idle timer (keeps screen on) while TTS is playing.
+    /// Safe to call multiple times — only acts when not already held.
+    private func disableIdleTimer() {
+        guard !ttsHoldsIdleTimerLock else { return }
+        // Don't override a voice-call lock — the call already holds the screen on.
+        if UIApplication.shared.isIdleTimerDisabled { return }
+        ttsHoldsIdleTimerLock = true
+        UIApplication.shared.isIdleTimerDisabled = true
+    }
+
+    /// Re-enables the idle timer once TTS finishes.
+    /// Only restores if TTS was the one that disabled it.
+    private func enableIdleTimer() {
+        guard ttsHoldsIdleTimerLock else { return }
+        ttsHoldsIdleTimerLock = false
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+
     /// Stops all speech and clears all queues.
     func stop() {
         // Clear streaming mode flag BEFORE stopping the on-device service so the
@@ -292,6 +318,9 @@ final class TextToSpeechService: NSObject {
 
         // Deactivate audio session to release hardware resources
         deactivateAudioSession()
+
+        // Re-enable auto-lock now that TTS has been stopped.
+        enableIdleTimer()
     }
 
     /// Tears down the server TTS pipeline cleanly.
@@ -494,6 +523,7 @@ final class TextToSpeechService: NSObject {
     private func speakWithKokoro(_ text: String) {
         isUsingKokoro = true
         state = .speaking
+        disableIdleTimer()
         Task {
             await kokoroService.speak(text)
         }
@@ -504,6 +534,7 @@ final class TextToSpeechService: NSObject {
     private func speakWithServer(_ text: String) {
         isUsingServer = true
         state = .speaking
+        disableIdleTimer()
         onStart?()
         let sentences = TTSTextPreprocessor.splitIntoSentences(text)
         serverQueue.append(contentsOf: sentences)
@@ -676,6 +707,7 @@ final class TextToSpeechService: NSObject {
         if !isStreamingTTS {
             state = .idle
             deactivateAudioSession()
+            enableIdleTimer()
             if hadItems {
                 onComplete?()
             }
@@ -697,6 +729,7 @@ final class TextToSpeechService: NSObject {
             if !isStreamingTTS && !isUsingKokoro && !isUsingServer {
                 state = .idle
                 deactivateAudioSession()
+                enableIdleTimer()
                 onComplete?()
             }
             return
@@ -741,6 +774,7 @@ final class TextToSpeechService: NSObject {
 
         isSpeakingSystemChunk = true
         state = .speaking
+        disableIdleTimer()
         if systemQueue.isEmpty { onStart?() }
 
         synthesizer.speak(utterance)

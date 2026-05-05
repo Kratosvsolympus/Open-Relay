@@ -43,12 +43,16 @@ struct StreamingMarkdownView: View {
     // Cache it as @State and only rebuild when accessibilityScale or textColor changes.
     @State private var cachedTheme: MarkdownTheme = MarkdownTheme.default
 
-    // Bug 1 + 11: Cache resolveSegments / parseSpecialBlocks output.
-    // Content is append-only during streaming, so a changed content string always
-    // means new work is needed. The common 60-fps case is a String == comparison.
+    // B4 fix: Cache resolveSegments / parseSpecialBlocks output.
+    // For finalized (non-streaming) messages the content never changes after
+    // first render, so parse runs exactly once per message lifetime.
+    // During streaming we always re-parse because content grows every frame.
+    // The common 60-fps streaming case is handled by the streaming split-render
+    // path in IsolatedAssistantMessage, which only passes the *live tail* here.
     @State private var cachedSegments: [ContentSegment] = []
     @State private var cachedSegmentsContent: String = ""
     @State private var cachedSegmentsIsStreaming: Bool = false
+
 
     init(content: String, isStreaming: Bool, textColor: SwiftUI.Color? = nil) {
         self.content = content
@@ -93,23 +97,12 @@ struct StreamingMarkdownView: View {
         if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             EmptyView()
         } else {
-            // Bug 1 + 11: only re-parse when content or isStreaming actually changed.
-            let segments: [ContentSegment] = {
-                if content == cachedSegmentsContent && isStreaming == cachedSegmentsIsStreaming {
-                    return cachedSegments
-                }
-                let result = resolveSegments()
-                // SwiftUI @ViewBuilder bodies cannot mutate @State directly, so
-                // defer the cache write to avoid "mutation during view update" warnings.
-                DispatchQueue.main.async {
-                    if cachedSegmentsContent != content || cachedSegmentsIsStreaming != isStreaming {
-                        cachedSegments = result
-                        cachedSegmentsContent = content
-                        cachedSegmentsIsStreaming = isStreaming
-                    }
-                }
-                return result
-            }()
+            // Always re-parse on every tick during streaming so VIZ segments
+            // appear on the same frame the @@@VIZ-START marker arrives.
+            // resolveSegments() is cheap (a few .range(of:) calls on a short
+            // string — the big <details> blob is stripped upstream before it
+            // ever reaches StreamingMarkdownView).
+            let segments: [ContentSegment] = resolveSegments()
             if segments.isEmpty {
                 EmptyView()
             } else if segments.count == 1, case .markdown(let text) = segments[0] {
@@ -145,6 +138,8 @@ struct StreamingMarkdownView: View {
     /// placeholder. This fixes the visible flash where the prose text disappeared
     /// during VIZ streaming and only reappeared once the stream finished.
     private func resolveSegments() -> [ContentSegment] {
+        let content = self.content
+
         if isStreaming {
             // ── VIZ marker path ───────────────────────────────────────────────
             let vizState = VizMarkerParser.streamingParse(content)
@@ -234,7 +229,7 @@ struct StreamingMarkdownView: View {
     /// Extracts the text that appears before `@@@VIZ-START` in the content.
     /// Returns the full text if the start marker is not present.
     private func extractPreVizText(_ text: String) -> String {
-        guard let startRange = text.range(of: "@@@VIZ-START") else { return text }
+        guard let startRange = VizMarkerParser.findRealStartMarkerRange(in: text) else { return text }
         return String(text[text.startIndex..<startRange.lowerBound])
     }
 
@@ -254,9 +249,8 @@ struct StreamingMarkdownView: View {
     /// Extracts the HTML/SVG content between `@@@VIZ-START` and `\n@@@VIZ-END`.
     /// Returns an empty string if the start marker is not present.
     private func extractVizContent(_ text: String) -> String {
-        let startMarker = "@@@VIZ-START"
         let endMarker = "\n@@@VIZ-END"
-        guard let startRange = text.range(of: startMarker) else { return "" }
+        guard let startRange = VizMarkerParser.findRealStartMarkerRange(in: text) else { return "" }
         var contentStart = startRange.upperBound
         if contentStart < text.endIndex, text[contentStart] == "\n" {
             contentStart = text.index(after: contentStart)
@@ -493,57 +487,142 @@ struct StreamingMarkdownView: View {
         return segments.isEmpty ? [.markdown(text)] : segments
     }
 
+    // MARK: - CommonMark fence helpers
+    //
+    // Per the CommonMark spec, a fenced code block closer must:
+    //   1. Have ≥ as many backticks as the opener (e.g. opener ``` → closer needs ≥ 3)
+    //   2. Have NO info string (only optional trailing whitespace after the backticks)
+    //   3. Have ≤ 3 spaces of leading indent
+    //
+    // These rules mean that when a model writes:
+    //
+    //   ```                ← opener (3 backticks, no lang)
+    //   ```bash            ← NOT a closer (has info string "bash") → treated as inner opener
+    //   aws elbv2 …
+    //   ```                ← closes the bash block
+    //   …more content…
+    //   ```                ← closes the outer block
+    //
+    // Our old naïve `range(of: "\n```")` matched the first ``` it found, eating
+    // everything after as prose. This helper finds the *correct* closer.
+
+    /// Returns how many leading backtick characters a fence line starts with,
+    /// and the info string (language tag) if any. Returns nil if the line is
+    /// not a fence line (fewer than 3 backticks, or > 3 leading spaces).
+    private static func parseFenceLine(_ line: Substring) -> (backtickCount: Int, info: String)? {
+        // Allow ≤ 3 leading spaces.
+        var idx = line.startIndex
+        var leadingSpaces = 0
+        while idx < line.endIndex, line[idx] == " ", leadingSpaces < 4 {
+            leadingSpaces += 1
+            idx = line.index(after: idx)
+        }
+        guard leadingSpaces < 4, idx < line.endIndex, line[idx] == "`" else { return nil }
+        var tickCount = 0
+        while idx < line.endIndex, line[idx] == "`" {
+            tickCount += 1
+            idx = line.index(after: idx)
+        }
+        guard tickCount >= 3 else { return nil }
+        let info = String(line[idx...]).trimmingCharacters(in: .whitespaces)
+        return (tickCount, info)
+    }
+
+    /// Finds the index of the closing fence line in `lines` starting from `startIdx`.
+    /// The closer must have ≥ `minTickCount` backticks and an EMPTY info string.
+    /// Returns the line index of the closer, or nil if not found (unclosed/streaming block).
+    private static func findClosingFence(in lines: [Substring], from startIdx: Int, minTickCount: Int) -> Int? {
+        for i in startIdx..<lines.count {
+            if let fence = parseFenceLine(lines[i]),
+               fence.backtickCount >= minTickCount,
+               fence.info.isEmpty {
+                return i
+            }
+        }
+        return nil
+    }
+
     /// Parses code blocks (chart/html/mermaid/svg/python) from a text chunk that
     /// has already had markdown images extracted.
+    ///
+    /// Uses CommonMark-compliant fence matching: the closing fence must have
+    /// ≥ as many backticks as the opener AND no info string. This correctly
+    /// handles nested code blocks (e.g. a ``` outer block containing ```bash inner
+    /// blocks — the inner ```bash lines are NOT mistaken for closers because they
+    /// have an info string).
     private func parseCodeBlocks(_ text: String) -> [ContentSegment] {
         guard text.contains("```") else { return [.markdown(text)] }
 
+        // Split into lines for fence detection. We work line-by-line so we can
+        // apply the CommonMark closer rules precisely.
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         var segments: [ContentSegment] = []
-        var remaining = text[text.startIndex...]
+        var i = 0
+        var proseLinesStart = 0   // first line of the current prose run
 
-        while let openRange = remaining.range(of: "```") {
-            let afterOpen = remaining[openRange.upperBound...]
-            guard let newlineIdx = afterOpen.firstIndex(of: "\n") else {
-                segments.append(.markdown(String(remaining)))
-                return segments
+        while i < lines.count {
+            guard let fence = Self.parseFenceLine(lines[i]) else {
+                i += 1
+                continue
             }
-            let lang = afterOpen[afterOpen.startIndex..<newlineIdx]
-                .trimmingCharacters(in: .whitespaces).lowercased()
-            let contentStart = afterOpen.index(after: newlineIdx)
-            let searchArea = remaining[contentStart...]
-            guard let closeRange = searchArea.range(of: "\n```") else {
-                segments.append(.markdown(String(remaining)))
-                return segments
+            // lines[i] is a fence opener. Find its matching closer.
+            let openerTickCount = fence.backtickCount
+            let lang = fence.info.lowercased()
+
+            guard let closerIdx = Self.findClosingFence(in: lines, from: i + 1, minTickCount: openerTickCount) else {
+                // No matching closer found — unclosed block (or streaming). Treat
+                // everything from here to end as plain markdown (MarkdownView handles it).
+                i += 1
+                continue
             }
-            let codeContent = String(remaining[contentStart..<closeRange.lowerBound])
+
+            // Flush preceding prose lines as a .markdown segment.
+            if proseLinesStart < i {
+                let proseText = lines[proseLinesStart..<i].joined(separator: "\n")
+                if !proseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    segments.append(.markdown(proseText))
+                }
+            }
+
+            // Extract code content (lines between opener and closer).
+            let codeContent = lines[(i + 1)..<closerIdx].joined(separator: "\n")
+
+            // Determine segment type based on language tag.
             let isChart = chartLanguageTags.contains(lang) && looksLikeChartJSON(codeContent)
             let isHTML = lang == "html" && codeContent.contains("<") && codeContent.contains(">") && codeContent.count >= 10
             let isMermaid = lang == "mermaid" && codeContent.trimmingCharacters(in: .whitespacesAndNewlines).count >= 5
             let isSVG = lang == "svg" && looksLikeSVG(codeContent)
             let isPython = pythonLanguageTags.contains(lang) && codeContent.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2
 
-            if isChart || isHTML || isMermaid || isSVG || isPython {
-                let preceding = String(remaining[remaining.startIndex..<openRange.lowerBound])
-                if !preceding.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    segments.append(.markdown(preceding))
-                }
-                if isChart { segments.append(.chart(codeContent)) }
-                else if isMermaid { segments.append(.mermaid(codeContent)) }
-                else if isSVG { segments.append(.svg(codeContent, isStreaming: false)) }
-                else if isPython { segments.append(.python(codeContent)) }
-                else { segments.append(.html(codeContent, isStreaming: false)) }
-                remaining = remaining[closeRange.upperBound...]
+            if isChart {
+                segments.append(.chart(codeContent))
+            } else if isMermaid {
+                segments.append(.mermaid(codeContent))
+            } else if isSVG {
+                segments.append(.svg(codeContent, isStreaming: false))
+            } else if isPython {
+                segments.append(.python(codeContent))
+            } else if isHTML {
+                segments.append(.html(codeContent, isStreaming: false))
             } else {
-                let blockEnd = closeRange.upperBound
-                segments.append(.markdown(String(remaining[remaining.startIndex..<blockEnd])))
-                remaining = remaining[blockEnd...]
+                // Plain code block — reconstruct the fenced markdown so MarkdownView
+                // renders it with syntax highlighting. Any literal ``` inside the code
+                // content (e.g. from nested blocks) are preserved as-is, which is
+                // exactly how WebUI renders such blocks.
+                let fence = String(repeating: "`", count: openerTickCount)
+                let fencedBlock = "\(fence)\(lang)\n\(codeContent)\n\(fence)"
+                segments.append(.markdown(fencedBlock))
             }
+
+            i = closerIdx + 1
+            proseLinesStart = i
         }
 
-        if !remaining.isEmpty {
-            let s = String(remaining)
-            if !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                segments.append(.markdown(s))
+        // Flush any trailing prose after the last code block.
+        if proseLinesStart < lines.count {
+            let trailingText = lines[proseLinesStart...].joined(separator: "\n")
+            if !trailingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                segments.append(.markdown(trailingText))
             }
         }
 

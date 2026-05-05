@@ -21,6 +21,8 @@
 		38AA00042FA9B00000SVGDRW /* SwiftDraw in Frameworks */ = {isa = PBXBuildFile; productRef = 38AA00032FA9B00000SVGDRW /* SwiftDraw */; };
 		38B6DED52FA55DDC001924FB /* MarkdownParser in Frameworks */ = {isa = PBXBuildFile; productRef = 38B6DED42FA55DDC001924FB /* MarkdownParser */; };
 		38B6DED72FA55DDC001924FB /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 38B6DED62FA55DDC001924FB /* MarkdownView */; };
+		38B6E7522FA94127001924FB /* MarkdownParser in Frameworks */ = {isa = PBXBuildFile; productRef = 38B6E7512FA94127001924FB /* MarkdownParser */; };
+		38B6E7542FA94127001924FB /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 38B6E7532FA94127001924FB /* MarkdownView */; };
 		38FEA3182FA2A18600A98F25 /* MLXAudioCore in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA3172FA2A18600A98F25 /* MLXAudioCore */; };
 		38FEA31A2FA2A18600A98F25 /* MLXAudioSTT in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA3192FA2A18600A98F25 /* MLXAudioSTT */; };
 		38FEA31C2FA2A18600A98F25 /* MLXAudioTTS in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA31B2FA2A18600A98F25 /* MLXAudioTTS */; };
@@ -113,9 +115,11 @@
 				387CAAD82F8AB953000B5152 /* MarkdownView in Frameworks */,
 				38B6DED72FA55DDC001924FB /* MarkdownView in Frameworks */,
 				3890E28F2F9845C10011D505 /* MarkdownParser in Frameworks */,
+				38B6E7522FA94127001924FB /* MarkdownParser in Frameworks */,
 				387CA4102F882523000B5152 /* MarkdownView in Frameworks */,
 				38B6DED52FA55DDC001924FB /* MarkdownParser in Frameworks */,
 				387CAAD62F8AB953000B5152 /* MarkdownParser in Frameworks */,
+				38B6E7542FA94127001924FB /* MarkdownView in Frameworks */,
 				3890E2912F9845C10011D505 /* MarkdownView in Frameworks */,
 				38AA00012FA9B00000MRMAID /* BeautifulMermaid in Frameworks */,
 				387CA40E2F882523000B5152 /* MarkdownParser in Frameworks */,
@@ -213,6 +217,8 @@
 				38FEA31B2FA2A18600A98F25 /* MLXAudioTTS */,
 				38B6DED42FA55DDC001924FB /* MarkdownParser */,
 				38B6DED62FA55DDC001924FB /* MarkdownView */,
+				38B6E7512FA94127001924FB /* MarkdownParser */,
+				38B6E7532FA94127001924FB /* MarkdownView */,
 			);
 			productName = "Open UI";
 			productReference = 38EB667D2F39CE5A00AED774 /* Open UI.app */;
@@ -254,7 +260,7 @@
 				38AA00052FA9B00000SVGDRW /* XCRemoteSwiftPackageReference "SwiftDraw" */,
 				38754A952F845BE60012CD28 /* XCRemoteSwiftPackageReference "ReactionContextMenu" */,
 				38FEA3162FA2A18600A98F25 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */,
-				38B6DED32FA55DDC001924FB /* XCLocalSwiftPackageReference "../MarkdownView" */,
+				38B6E7502FA94127001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 38EB667E2F39CE5A00AED774 /* Products */;
@@ -317,7 +323,7 @@
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
 				CODE_SIGN_ENTITLEMENTS = OpenUIWidgets/OpenUIWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 6ARX8PF3MT;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = OpenUIWidgets/Info.plist;
@@ -329,7 +335,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.5;
+				MARKETING_VERSION = 4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.OpenUIWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -349,7 +355,7 @@
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
 				CODE_SIGN_ENTITLEMENTS = OpenUIWidgets/OpenUIWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 6ARX8PF3MT;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = OpenUIWidgets/Info.plist;
@@ -361,7 +367,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.5;
+				MARKETING_VERSION = 4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.OpenUIWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -506,7 +512,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = "Open UI/Open UI.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 6ARX8PF3MT;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -530,7 +536,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.5;
+				MARKETING_VERSION = 4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -554,7 +560,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = "Open UI/Open UI.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 6ARX8PF3MT;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -578,7 +584,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.5;
+				MARKETING_VERSION = 4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -627,13 +633,6 @@
 		};
 /* End XCConfigurationList section */
 
-/* Begin XCLocalSwiftPackageReference section */
-		38B6DED32FA55DDC001924FB /* XCLocalSwiftPackageReference "../MarkdownView" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = ../MarkdownView;
-		};
-/* End XCLocalSwiftPackageReference section */
-
 /* Begin XCRemoteSwiftPackageReference section */
 		38754A952F845BE60012CD28 /* XCRemoteSwiftPackageReference "ReactionContextMenu" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -657,6 +656,14 @@
 			requirement = {
 				kind = upToNextMajorVersion;
 				minimumVersion = 0.17.0;
+			};
+		};
+		38B6E7502FA94127001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/Ichigo3766/MarkdownView";
+			requirement = {
+				branch = main;
+				kind = branch;
 			};
 		};
 		38FEA3162FA2A18600A98F25 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */ = {
@@ -715,6 +722,16 @@
 		};
 		38B6DED62FA55DDC001924FB /* MarkdownView */ = {
 			isa = XCSwiftPackageProductDependency;
+			productName = MarkdownView;
+		};
+		38B6E7512FA94127001924FB /* MarkdownParser */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 38B6E7502FA94127001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */;
+			productName = MarkdownParser;
+		};
+		38B6E7532FA94127001924FB /* MarkdownView */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 38B6E7502FA94127001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */;
 			productName = MarkdownView;
 		};
 		38FEA3172FA2A18600A98F25 /* MLXAudioCore */ = {

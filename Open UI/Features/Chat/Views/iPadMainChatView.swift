@@ -2090,16 +2090,20 @@ private extension View {
             }
             .onChange(of: scenePhase) { oldPhase, newPhase in
                 if newPhase == .active && oldPhase != .active {
+                    let chatVM = dependencies.activeChatStore.viewModel(for: activeConversationId.wrappedValue)
                     Task {
                         if let socket = dependencies.socketService,
                            !socket.isConnected, !socket.isConnecting {
                             socket.connect()
                         }
-                        // Refresh conversations, folders, AND channels on foreground
-                        // (mirrors iPhone's refreshAllDataOnForeground)
+                        // Refresh conversations, folders, channels, and pinned models on foreground
                         await withTaskGroup(of: Void.self) { group in
                             group.addTask { await listViewModel.refreshIfStale() }
                             group.addTask { await listViewModel.folderViewModel.refreshFolders() }
+                            if let channelListVM {
+                                group.addTask { await channelListVM.refreshChannels() }
+                            }
+                            group.addTask { await chatVM.fetchPinnedModels() }
                         }
                         dependencies.updateWidgetData(conversations: listViewModel.conversations)
                     }
@@ -2122,6 +2126,9 @@ private extension View {
                     await withTaskGroup(of: Void.self) { group in
                         group.addTask { await listViewModel.refreshConversations() }
                         group.addTask { await listViewModel.folderViewModel.refreshFolders() }
+                        if let channelListVM {
+                            group.addTask { await channelListVM.refreshChannels() }
+                        }
                     }
                 }
             }
